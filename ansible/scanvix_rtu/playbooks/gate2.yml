@@ -1,0 +1,764 @@
+---
+# ============================================================================
+# Storm Energy RTU — Gate 2 Full Deployment
+# ============================================================================
+# Deploys and validates the complete Storm Energy RTU stack on scanvix109.
+#
+# ARCHITECTURE (single-process):
+#   StormEnergyRTU-API  — uvicorn app.main:app
+#     ├── FastAPI REST   0.0.0.0:{{ scanvix_api_port }}
+#     ├── MQTTConsumer   → StormMosquitto 127.0.0.1:1883
+#     └── TCPServer      0.0.0.0:{{ scanvix_tcp_port }}
+#   StormMosquitto      — NSSM-wrapped mosquitto.exe (broker, port 1883)
+#
+# DO NOT create StormEnergyRTU-MQTT or StormEnergyRTU-TCP as standalone
+# services — consumer.py and server.py have no __main__ entry points.
+#
+# SAFETY: Never touches AllipuramPFCMD-Go-Receiver, pfcmd-receiver.exe,
+#         D:\AllipuramPFCMD, receiver.env, port 8088, or Allipuram FW rules.
+#
+# Pre-requisite: Run gate2_preflight_check.yml first and resolve all FAILs.
+#
+# Usage:
+#   ANSIBLE_CONFIG=ansible.cfg ansible-playbook \
+#     -i inventory/hosts.ini playbooks/gate2.yml \
+#     --extra-vars "scanvix_mqtt_password=<pw> scanvix_api_secret_key=<key>"
+# NOTE: No SQL credentials -- Windows Integrated Authentication via svc_ansible.
+# ============================================================================
+
+- name: Storm Energy RTU — Gate 2 Full Deployment
+  hosts: scanvix_rtu
+  gather_facts: false
+
+  # ── PRE-TASKS ─────────────────────────────────────────────────────────────
+  pre_tasks:
+
+    # ── 1. Credential validation ───────────────────────────────────────────
+    - name: PRE | Validate runtime credentials supplied
+      ansible.builtin.assert:
+        that:
+          - scanvix_mqtt_password | default('') | length > 0
+          - scanvix_api_secret_key | default('') | length > 0
+        fail_msg: >-
+          Gate 2 requires two --extra-vars:
+          scanvix_mqtt_password, scanvix_api_secret_key.
+          SQL credentials are NOT required -- Windows Integrated Authentication is used.
+        success_msg: "Credentials present (values redacted)"
+
+    # ── 2. Core variable validation ────────────────────────────────────────
+    - name: PRE | Validate core variables
+      ansible.builtin.assert:
+        that:
+          - scanvix_install_dir | default('') | length > 0
+          - scanvix_app_dir | default('') | length > 0
+          - scanvix_venv_dir | default('') | length > 0
+          - scanvix_logs_dir | default('') | length > 0
+          - scanvix_nssm_exe | default('') | length > 0
+          - scanvix_mosquitto_exe | default('') | length > 0
+          - scanvix_mosquitto_conf | default('') | length > 0
+          - scanvix_mqtt_passwd_dir | default('') | length > 0
+          - scanvix_mqtt_passwd_file | default('') | length > 0
+          - scanvix_mqtt_username | default('') | length > 0
+          - scanvix_native_mqtt_service_name | default('') | length > 0
+          - scanvix_storm_mqtt_service_name | default('') | length > 0
+          - scanvix_api_service_name | default('') | length > 0
+          - scanvix_sql_server | default('') | length > 0
+          - scanvix_svc_account | default('') | length > 0
+          - scanvix_api_port | default(0) | int > 0
+          - scanvix_tcp_port | default(0) | int > 0
+          - scanvix_mqtt_port | default(0) | int > 0
+        fail_msg: "One or more core variables are missing — check group_vars/all.yml"
+        success_msg: "Core variables validated"
+
+    # ── 3. Gate 1 prerequisite checks ─────────────────────────────────────
+    - name: PRE | G1 — Install directory exists
+      ansible.windows.win_shell: |
+        if (-not (Test-Path '{{ scanvix_install_dir }}')) {
+          Write-Error "Install dir not found: {{ scanvix_install_dir }}"
+          exit 1
+        }
+        Write-Output "OK: {{ scanvix_install_dir }}"
+      register: pre_installdir
+      changed_when: false
+
+    - name: PRE | G1 — Venv python works
+      ansible.windows.win_shell: |
+        $py = '{{ scanvix_venv_dir }}\Scripts\python.exe'
+        if (-not (Test-Path $py)) {
+          Write-Error "Venv python not found: $py"
+          exit 1
+        }
+        $v = & $py --version 2>&1
+        Write-Output "OK: $v"
+      register: pre_venv
+      changed_when: false
+
+    - name: PRE | G1 — STORM_ENERGY_RTU database accessible
+      ansible.windows.win_shell: |
+        try {
+          $cs  = "Server={{ scanvix_sql_server }};Database=master;Integrated Security=True;TrustServerCertificate=True"
+          $con = New-Object System.Data.SqlClient.SqlConnection($cs)
+          $con.Open()
+          $cmd = $con.CreateCommand()
+          $cmd.CommandText = "SELECT COUNT(1) FROM sys.databases WHERE name='STORM_ENERGY_RTU'"
+          $n = $cmd.ExecuteScalar()
+          $con.Close()
+          if ($n -eq 0) { Write-Error "STORM_ENERGY_RTU database not found"; exit 1 }
+          Write-Output "OK: STORM_ENERGY_RTU exists on {{ scanvix_sql_server }}"
+        } catch {
+          Write-Error "SQL check failed: $_"
+          exit 1
+        }
+      register: pre_db
+      changed_when: false
+
+    - name: PRE | G1 — mosquitto.exe present
+      ansible.windows.win_shell: |
+        if (-not (Test-Path '{{ scanvix_mosquitto_exe }}')) {
+          Write-Error "mosquitto.exe not found: {{ scanvix_mosquitto_exe }}"
+          exit 1
+        }
+        Write-Output "OK: {{ scanvix_mosquitto_exe }}"
+      register: pre_mqttexe
+      changed_when: false
+
+    - name: PRE | G1 — NSSM present
+      ansible.windows.win_shell: |
+        if (-not (Test-Path '{{ scanvix_nssm_exe }}')) {
+          Write-Error "NSSM not found: {{ scanvix_nssm_exe }}"
+          exit 1
+        }
+        Write-Output "OK: {{ scanvix_nssm_exe }}"
+      register: pre_nssm
+      changed_when: false
+
+    # ── 4. Allipuram safety — BEFORE any deployment ────────────────────────
+    - name: PRE | SAFETY — AllipuramPFCMD-Go-Receiver baseline (before deployment)
+      ansible.windows.win_shell: |
+        $svc  = Get-Service 'AllipuramPFCMD-Go-Receiver' -ErrorAction SilentlyContinue
+        $conn = Get-NetTCPConnection -LocalPort 8088 -State Listen -ErrorAction SilentlyContinue
+        $proc = Get-Process pfcmd-receiver -ErrorAction SilentlyContinue
+
+        $svcState  = if ($svc)  { $svc.Status.ToString() } else { "NOT FOUND" }
+        $portOwner = if ($conn) {
+          $ownerPid = ($conn | Select-Object -First 1).OwningProcess
+          $p   = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+          if ($p) { "$($p.Name) pid=$ownerPid" } else { "pid=$ownerPid" }
+        } else { "NOT LISTENING" }
+
+        Write-Output "BEFORE_DEPLOY: AllipuramPFCMD-Go-Receiver=$svcState"
+        Write-Output "BEFORE_DEPLOY: port_8088_owner=$portOwner"
+
+        if ($svcState -ne 'Running') {
+          Write-Error "SAFETY VIOLATION: AllipuramPFCMD-Go-Receiver is $svcState — must be Running before Gate 2"
+          exit 1
+        }
+        if ($portOwner -notmatch 'pfcmd-receiver') {
+          Write-Error "SAFETY VIOLATION: port 8088 not owned by pfcmd-receiver.exe — owner=$portOwner"
+          exit 1
+        }
+      register: pre_safety_before
+      changed_when: false
+
+    - name: PRE | SAFETY baseline
+      ansible.builtin.debug:
+        msg: "{{ pre_safety_before.stdout_lines }}"
+
+  # ── TASKS (four deployment phases) ───────────────────────────────────────
+  tasks:
+
+    # ── Phase A: Deploy .env and Storm RTU backend ─────────────────────────
+    - name: "PHASE A | Deploy Storm RTU backend (.env + app files)"
+      ansible.builtin.include_role:
+        name: storm_rtu
+      vars:
+        scanvix_mqtt_password: "{{ scanvix_mqtt_password }}"
+        scanvix_api_secret_key: "{{ scanvix_api_secret_key }}"
+
+    # ── Phase B: Deploy StormMosquitto (MQTT broker) ───────────────────────
+    - name: "PHASE B | Configure StormMosquitto broker"
+      ansible.builtin.include_role:
+        name: mqtt
+        tasks_from: gate2
+      vars:
+        scanvix_mqtt_password: "{{ scanvix_mqtt_password }}"
+
+    # ── Phase C: Register and start StormEnergyRTU-API (API-only service) ──
+    # NOTE: Only ONE service is created.
+    # consumer.py and server.py have no __main__ — standalone MQTT/TCP
+    # services would PAUSE immediately. app/main.py starts all three.
+    - name: "PHASE C | Register StormEnergyRTU-API Windows service"
+      ansible.builtin.include_role:
+        name: services
+
+    # ── Phase D: Firewall rules ────────────────────────────────────────────
+    - name: "PHASE D | Apply firewall rules"
+      ansible.builtin.include_role:
+        name: firewall
+
+  # ── POST-TASKS (verification, E2E tests, final report) ───────────────────
+  post_tasks:
+
+    # ── P1. Wait for services to initialize ───────────────────────────────
+    - name: POST | Wait 15s for StormEnergyRTU-API to initialize
+      ansible.builtin.pause:
+        seconds: 15
+
+    # ── P2. Port LISTEN verification ──────────────────────────────────────
+    - name: POST | Verify port 8090 (API) is LISTENING
+      ansible.windows.win_shell: |
+        $conn = Get-NetTCPConnection -LocalPort {{ scanvix_api_port }} -State Listen -ErrorAction SilentlyContinue
+        if ($conn) {
+          $ownerPid  = ($conn | Select-Object -First 1).OwningProcess
+          $proc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+          $name = if ($proc) { $proc.Name } else { "pid $ownerPid" }
+          Write-Output "PASS: port {{ scanvix_api_port }} LISTENING — process=$name pid=$ownerPid"
+        } else {
+          Write-Output "FAIL: port {{ scanvix_api_port }} NOT LISTENING"
+        }
+      register: port8090_check
+      changed_when: false
+
+    - name: POST | Port 8090 result
+      ansible.builtin.debug:
+        msg: "{{ port8090_check.stdout | trim }}"
+
+    - name: POST | FAIL if port 8090 not LISTENING
+      ansible.builtin.fail:
+        msg: "Port {{ scanvix_api_port }} is not LISTENING — StormEnergyRTU-API failed to start"
+      when: "'FAIL' in port8090_check.stdout"
+
+    - name: POST | Verify port 9000 (TCP server) is LISTENING
+      ansible.windows.win_shell: |
+        $conn = Get-NetTCPConnection -LocalPort {{ scanvix_tcp_port }} -State Listen -ErrorAction SilentlyContinue
+        if ($conn) {
+          $ownerPid  = ($conn | Select-Object -First 1).OwningProcess
+          $proc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+          $name = if ($proc) { $proc.Name } else { "pid $ownerPid" }
+          Write-Output "PASS: port {{ scanvix_tcp_port }} LISTENING — process=$name pid=$ownerPid"
+        } else {
+          Write-Output "FAIL: port {{ scanvix_tcp_port }} NOT LISTENING"
+        }
+      register: port9000_check
+      changed_when: false
+
+    - name: POST | Port 9000 result
+      ansible.builtin.debug:
+        msg: "{{ port9000_check.stdout | trim }}"
+
+    - name: POST | FAIL if port 9000 not LISTENING
+      ansible.builtin.fail:
+        msg: "Port {{ scanvix_tcp_port }} is not LISTENING — TCPServer failed to start (check StormEnergyRTU-API logs)"
+      when: "'FAIL' in port9000_check.stdout"
+
+    - name: POST | Verify port 1883 (StormMosquitto) is LISTENING
+      ansible.windows.win_shell: |
+        $conn = Get-NetTCPConnection -LocalPort {{ scanvix_mqtt_port }} -State Listen -ErrorAction SilentlyContinue
+        if ($conn) {
+          $ownerPid  = ($conn | Select-Object -First 1).OwningProcess
+          $proc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+          $name = if ($proc) { $proc.Name } else { "pid $ownerPid" }
+          Write-Output "PASS: port {{ scanvix_mqtt_port }} LISTENING — process=$name pid=$ownerPid"
+        } else {
+          Write-Output "FAIL: port {{ scanvix_mqtt_port }} NOT LISTENING — StormMosquitto broker not running"
+        }
+      register: port1883_check
+      changed_when: false
+
+    - name: POST | Port 1883 result
+      ansible.builtin.debug:
+        msg: "{{ port1883_check.stdout | trim }}"
+
+    - name: POST | FAIL if port 1883 not LISTENING
+      ansible.builtin.fail:
+        msg: "Port {{ scanvix_mqtt_port }} is not LISTENING — StormMosquitto failed to start"
+      when: "'FAIL' in port1883_check.stdout"
+
+    # ── P3. FastAPI /health check ──────────────────────────────────────────
+    - name: POST | HTTP GET /health (FastAPI)
+      ansible.windows.win_uri:
+        url: "http://127.0.0.1:{{ scanvix_api_port }}/health"
+        method: GET
+        status_code: 200
+        return_content: true
+      register: health_check
+
+    - name: POST | /health result
+      ansible.builtin.debug:
+        msg: "HTTP {{ health_check.status_code }} — {{ health_check.content | trim }}"
+
+    # ── P4. MQTT End-to-End Test ───────────────────────────────────────────
+    # Deterministic device ID + timestamp for DB row lookup
+    - name: POST | MQTT E2E — set deterministic test identifiers
+      ansible.builtin.set_fact:
+        mqtt_test_device: "gate2-mqtt-{{ ansible_date_time.epoch | default('00000000') }}"
+        mqtt_test_ts: "{{ ansible_date_time.iso8601 | default('2024-01-01T00:00:00') }}"
+
+    - name: POST | MQTT E2E — publish authenticated test telemetry via mosquitto_pub.exe
+      ansible.windows.win_shell: |
+        $exe = 'C:\Program Files\mosquitto\mosquitto_pub.exe'
+        if (-not (Test-Path $exe)) {
+          Write-Error "mosquitto_pub.exe not found — cannot run MQTT E2E test"
+          exit 1
+        }
+
+        $payload = @{
+          deviceId  = '{{ mqtt_test_device }}'
+          timestamp = '{{ mqtt_test_ts }}'
+          flowRate  = 42.5
+          pressure  = 3.1
+          protocol  = 'MQTT'
+        } | ConvertTo-Json -Compress
+
+        $topic = 'storm/meters/{{ mqtt_test_device }}/telemetry'
+
+        & $exe `
+          --host 127.0.0.1 `
+          --port {{ scanvix_mqtt_port }} `
+          --username '{{ scanvix_mqtt_username }}' `
+          --pw '$MQTT_PW' `
+          --topic $topic `
+          --message $payload `
+          --qos 1
+
+        if ($LASTEXITCODE -eq 0) {
+          Write-Output "MQTT_PUBLISH: OK — topic=$topic"
+          Write-Output "MQTT_PAYLOAD: $payload"
+        } else {
+          Write-Error "MQTT_PUBLISH: FAILED (exit $LASTEXITCODE)"
+          exit 1
+        }
+      environment:
+        MQTT_PW: "{{ scanvix_mqtt_password }}"
+      register: mqtt_publish
+      no_log: true
+
+    - name: POST | MQTT E2E — publish result (no credentials)
+      ansible.builtin.debug:
+        msg: "{{ mqtt_publish.stdout_lines }}"
+
+    - name: POST | MQTT E2E — wait 5s for consumer to process and insert DB row
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: POST | MQTT E2E — verify DB row in STORM_ENERGY_RTU.Telemetry
+      ansible.windows.win_shell: |
+        try {
+          $cs  = "Server={{ scanvix_sql_server }};Database=STORM_ENERGY_RTU;Integrated Security=True;TrustServerCertificate=True"
+          $con = New-Object System.Data.SqlClient.SqlConnection($cs)
+          $con.Open()
+          $cmd = $con.CreateCommand()
+          $cmd.CommandText = ("SELECT TOP 1 DeviceId, " +
+            "CONVERT(varchar(30), [Timestamp], 126) AS [Timestamp], " +
+            "Protocol, FlowRate, Pressure, " +
+            "CONVERT(varchar(30), CreatedAt, 126) AS CreatedAt " +
+            "FROM Telemetry " +
+            "WHERE DeviceId = '{{ mqtt_test_device }}' " +
+            "ORDER BY CreatedAt DESC")
+          $r = $cmd.ExecuteReader()
+          if ($r.Read()) {
+            Write-Output "DB_ROW_FOUND"
+            Write-Output "  DeviceId  : $($r['DeviceId'])"
+            Write-Output "  Timestamp : $($r['Timestamp'])"
+            Write-Output "  Protocol  : $($r['Protocol'])"
+            Write-Output "  FlowRate  : $($r['FlowRate'])"
+            Write-Output "  Pressure  : $($r['Pressure'])"
+            Write-Output "  CreatedAt : $($r['CreatedAt'])"
+          } else {
+            Write-Output "DB_ROW_MISSING: No telemetry row found for DeviceId={{ mqtt_test_device }}"
+          }
+          $r.Close(); $con.Close()
+        } catch {
+          Write-Error "DB query failed: $_"
+          exit 1
+        }
+      register: mqtt_db_check
+      no_log: true
+
+    - name: POST | MQTT E2E — DB row result
+      ansible.builtin.debug:
+        msg: "{{ mqtt_db_check.stdout_lines }}"
+
+    - name: POST | MQTT E2E — FAIL if DB row missing
+      ansible.builtin.fail:
+        msg: >-
+          MQTT E2E FAILED: telemetry was published but no DB row was created.
+          Check StormEnergyRTU-API logs for MQTT consumer errors.
+      when: "'DB_ROW_MISSING' in mqtt_db_check.stdout"
+
+    # ── P5. TCP End-to-End Test ────────────────────────────────────────────
+    # Runs scripts/tcp_client.py from the Ansible controller
+    # Requires: pip install paho-mqtt on the controller (for telemetry_generator import)
+    - name: POST | TCP E2E — set deterministic test identifier
+      ansible.builtin.set_fact:
+        tcp_test_device: "gate2-tcp-{{ ansible_date_time.epoch | default('00000001') }}"
+
+    - name: POST | TCP E2E — check Python available on controller
+      ansible.builtin.command:
+        cmd: python --version
+      delegate_to: localhost
+      register: ctrl_python
+      changed_when: false
+      failed_when: false
+
+    - name: POST | TCP E2E — controller Python version
+      ansible.builtin.debug:
+        msg: "Controller: {{ ctrl_python.stdout | trim if ctrl_python.rc == 0 else 'python not found — TCP E2E will be skipped' }}"
+
+    - name: POST | TCP E2E — run scripts/tcp_client.py from controller → 192.168.0.109:{{ scanvix_tcp_port }}
+      ansible.builtin.command:
+        cmd: >
+          python scripts/tcp_client.py
+          --host {{ ansible_host }}
+          --port {{ scanvix_tcp_port }}
+          --device {{ tcp_test_device }}
+          --count 1
+        chdir: "{{ playbook_dir }}/../../.."
+      delegate_to: localhost
+      register: tcp_client_result
+      when: ctrl_python.rc == 0
+      failed_when:
+        - tcp_client_result.rc is defined
+        - tcp_client_result.rc != 0
+        - "'no ACK within timeout' not in (tcp_client_result.stdout | default(''))"
+
+    - name: POST | TCP E2E — client output
+      ansible.builtin.debug:
+        msg: "{{ tcp_client_result.stdout_lines | default(['TCP test skipped — python not available on controller']) }}"
+
+    - name: POST | TCP E2E — NOTE on NullAckStrategy
+      ansible.builtin.debug:
+        msg: >-
+          NOTE: NullAckStrategy is active — TCP server sends no ACK (TBD with Scanvix).
+          A 'no ACK within timeout' message from tcp_client.py is expected and not a failure.
+      when: >-
+        ctrl_python.rc == 0 and
+        tcp_client_result.stdout is defined and
+        'no ACK' in tcp_client_result.stdout
+
+    - name: POST | TCP E2E — wait 5s for TCPServer to process and insert DB row
+      ansible.builtin.pause:
+        seconds: 5
+      when: ctrl_python.rc == 0 and tcp_client_result is not skipped
+
+    - name: POST | TCP E2E — verify DB row in STORM_ENERGY_RTU.Telemetry
+      ansible.windows.win_shell: |
+        try {
+          $cs  = "Server={{ scanvix_sql_server }};Database=STORM_ENERGY_RTU;Integrated Security=True;TrustServerCertificate=True"
+          $con = New-Object System.Data.SqlClient.SqlConnection($cs)
+          $con.Open()
+          $cmd = $con.CreateCommand()
+          $cmd.CommandText = ("SELECT TOP 1 DeviceId, " +
+            "CONVERT(varchar(30), [Timestamp], 126) AS [Timestamp], " +
+            "Protocol, FlowRate, Pressure, " +
+            "CONVERT(varchar(30), CreatedAt, 126) AS CreatedAt " +
+            "FROM Telemetry " +
+            "WHERE DeviceId = '{{ tcp_test_device }}' " +
+            "ORDER BY CreatedAt DESC")
+          $r = $cmd.ExecuteReader()
+          if ($r.Read()) {
+            Write-Output "DB_ROW_FOUND"
+            Write-Output "  DeviceId  : $($r['DeviceId'])"
+            Write-Output "  Timestamp : $($r['Timestamp'])"
+            Write-Output "  Protocol  : $($r['Protocol'])"
+            Write-Output "  FlowRate  : $($r['FlowRate'])"
+            Write-Output "  Pressure  : $($r['Pressure'])"
+            Write-Output "  CreatedAt : $($r['CreatedAt'])"
+          } else {
+            Write-Output "DB_ROW_MISSING: No telemetry row found for DeviceId={{ tcp_test_device }}"
+          }
+          $r.Close(); $con.Close()
+        } catch {
+          Write-Error "DB query failed: $_"
+          exit 1
+        }
+      register: tcp_db_check
+      no_log: true
+      when: ctrl_python.rc == 0 and tcp_client_result is not skipped
+
+    - name: POST | TCP E2E — DB row result
+      ansible.builtin.debug:
+        msg: "{{ tcp_db_check.stdout_lines | default(['TCP DB check skipped']) }}"
+
+    - name: POST | TCP E2E — FAIL if DB row missing
+      ansible.builtin.fail:
+        msg: >-
+          TCP E2E FAILED: telemetry was sent via TCP but no DB row was created.
+          Check StormEnergyRTU-API logs for TCP server parse/ingest errors.
+      when: >-
+        tcp_db_check is not skipped and
+        tcp_db_check.stdout is defined and
+        'DB_ROW_MISSING' in tcp_db_check.stdout
+
+    # ── P6. Duplicate deduplication test ──────────────────────────────────
+    - name: POST | DEDUP — publish same MQTT message twice (same timestamp)
+      ansible.windows.win_shell: |
+        $exe     = 'C:\Program Files\mosquitto\mosquitto_pub.exe'
+        $device  = 'gate2-dedup-test'
+        $ts      = '2024-01-01T12:00:00Z'
+        $payload = '{"deviceId":"' + $device + '","timestamp":"' + $ts + '","flowRate":1.0,"protocol":"MQTT"}'
+        $topic   = 'storm/meters/' + $device + '/telemetry'
+
+        for ($i = 1; $i -le 2; $i++) {
+          & $exe --host 127.0.0.1 --port {{ scanvix_mqtt_port }} `
+                 --username '{{ scanvix_mqtt_username }}' --pw $env:MQTT_PW `
+                 --topic $topic --message $payload --qos 1
+          Write-Output "Publish $i sent"
+          if ($i -eq 1) { Start-Sleep -Seconds 2 }
+        }
+      environment:
+        MQTT_PW: "{{ scanvix_mqtt_password }}"
+      register: dedup_publish
+      no_log: true
+
+    - name: POST | DEDUP — wait 5s for processing
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: POST | DEDUP — verify only ONE row inserted (UniqueConstraint)
+      ansible.windows.win_shell: |
+        try {
+          $cs  = "Server={{ scanvix_sql_server }};Database=STORM_ENERGY_RTU;Integrated Security=True;TrustServerCertificate=True"
+          $con = New-Object System.Data.SqlClient.SqlConnection($cs)
+          $con.Open()
+          $cmd = $con.CreateCommand()
+          $cmd.CommandText = "SELECT COUNT(1) FROM Telemetry WHERE DeviceId='gate2-dedup-test' AND [Timestamp]='2024-01-01T12:00:00Z'"
+          $n   = $cmd.ExecuteScalar()
+          $con.Close()
+          if ($n -eq 1) {
+            Write-Output "DEDUP_PASS: exactly 1 row for duplicate input (UniqueConstraint working)"
+          } elseif ($n -gt 1) {
+            Write-Output "DEDUP_FAIL: $n rows inserted — deduplication not working"
+          } else {
+            Write-Output "DEDUP_WARN: 0 rows found — message may not have been consumed yet"
+          }
+        } catch {
+          Write-Error "DB query failed: $_"
+        }
+      register: dedup_check
+      no_log: true
+
+    - name: POST | DEDUP — result
+      ansible.builtin.debug:
+        msg: "{{ dedup_check.stdout | trim }}"
+
+    # ── P7. Malformed message resilience test ──────────────────────────────
+    - name: POST | MALFORMED — publish message missing deviceId field
+      ansible.windows.win_shell: |
+        $exe     = 'C:\Program Files\mosquitto\mosquitto_pub.exe'
+        $payload = '{"timestamp":"2024-01-01T12:00:01Z","flowRate":9.9}'
+        $topic   = 'storm/meters/gate2-malformed-test/telemetry'
+        & $exe --host 127.0.0.1 --port {{ scanvix_mqtt_port }} `
+               --username '{{ scanvix_mqtt_username }}' --pw $env:MQTT_PW `
+               --topic $topic --message $payload --qos 1
+        Write-Output "Malformed publish sent (exit $LASTEXITCODE)"
+      environment:
+        MQTT_PW: "{{ scanvix_mqtt_password }}"
+      register: malformed_pub
+      no_log: true
+
+    - name: POST | MALFORMED — wait 3s then confirm API still Running
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: POST | MALFORMED — verify StormEnergyRTU-API still Running after malformed message
+      ansible.windows.win_shell: |
+        $svc = Get-Service -Name '{{ scanvix_api_service_name }}' -ErrorAction SilentlyContinue
+        $status = if ($svc) { $svc.Status.ToString() } else { "NOT FOUND" }
+        Write-Output "{{ scanvix_api_service_name }}: $status"
+        if ($status -ne 'Running') { exit 1 }
+      register: malformed_check
+      changed_when: false
+
+    - name: POST | MALFORMED — result
+      ansible.builtin.debug:
+        msg: "{{ malformed_check.stdout | trim }}"
+
+    # ── P8. Service restart idempotency test ───────────────────────────────
+    - name: POST | RESTART — stop StormEnergyRTU-API
+      ansible.windows.win_service:
+        name: '{{ scanvix_api_service_name }}'
+        state: stopped
+
+    - name: POST | RESTART — start StormEnergyRTU-API
+      ansible.windows.win_service:
+        name: '{{ scanvix_api_service_name }}'
+        state: started
+
+    - name: POST | RESTART — wait 10s for restart
+      ansible.builtin.pause:
+        seconds: 10
+
+    - name: POST | RESTART — verify port 8090 re-binds after restart
+      ansible.windows.win_shell: |
+        $conn = Get-NetTCPConnection -LocalPort {{ scanvix_api_port }} -State Listen -ErrorAction SilentlyContinue
+        if ($conn) {
+          $ownerPid  = ($conn | Select-Object -First 1).OwningProcess
+          $proc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+          Write-Output "RESTART_PASS: port {{ scanvix_api_port }} re-bound after service restart (pid $ownerPid)"
+        } else {
+          Write-Output "RESTART_FAIL: port {{ scanvix_api_port }} NOT LISTENING after restart"
+        }
+      register: restart_check
+      changed_when: false
+
+    - name: POST | RESTART — result
+      ansible.builtin.debug:
+        msg: "{{ restart_check.stdout | trim }}"
+
+    - name: POST | RESTART — FAIL if port 8090 not re-bound
+      ansible.builtin.fail:
+        msg: "Service restart idempotency FAILED — port {{ scanvix_api_port }} did not re-bind"
+      when: "'RESTART_FAIL' in restart_check.stdout"
+
+    # ── P9. Allipuram safety — AFTER deployment ────────────────────────────
+    - name: POST | SAFETY — AllipuramPFCMD-Go-Receiver verification after deployment
+      ansible.windows.win_shell: |
+        $svc  = Get-Service 'AllipuramPFCMD-Go-Receiver' -ErrorAction SilentlyContinue
+        $conn = Get-NetTCPConnection -LocalPort 8088 -State Listen -ErrorAction SilentlyContinue
+        $proc = Get-Process pfcmd-receiver -ErrorAction SilentlyContinue
+
+        $svcState  = if ($svc)  { $svc.Status.ToString() } else { "NOT FOUND" }
+        $portOwner = if ($conn) {
+          $ownerPid = ($conn | Select-Object -First 1).OwningProcess
+          $p   = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+          if ($p) { "$($p.Name) pid=$ownerPid" } else { "pid=$ownerPid" }
+        } else { "NOT LISTENING" }
+
+        Write-Output "AFTER_DEPLOY: AllipuramPFCMD-Go-Receiver=$svcState"
+        Write-Output "AFTER_DEPLOY: port_8088_owner=$portOwner"
+        Write-Output "AFTER_DEPLOY: AllipuramDir_exists=$(Test-Path 'D:\AllipuramPFCMD')"
+
+        $modified = $false
+        if ($svcState -ne 'Running') {
+          Write-Output "SAFETY_VIOLATION: GoReceiver is $svcState (was Running before)"
+          $modified = $true
+        }
+        if ($portOwner -notmatch 'pfcmd-receiver') {
+          Write-Output "SAFETY_VIOLATION: port 8088 owner changed to '$portOwner'"
+          $modified = $true
+        }
+        if (-not $modified) {
+          Write-Output "ALLIPURAM_MODIFIED: NO"
+        }
+      register: post_safety
+      changed_when: false
+
+    - name: POST | SAFETY — after-deployment result
+      ansible.builtin.debug:
+        msg: "{{ post_safety.stdout_lines }}"
+
+    - name: POST | SAFETY — FAIL if Allipuram was modified
+      ansible.builtin.fail:
+        msg: >-
+          CRITICAL SAFETY VIOLATION: Allipuram receiver was modified during deployment.
+          Check post_safety output above. Investigate before proceeding.
+      when: "'SAFETY_VIOLATION' in post_safety.stdout"
+
+    # ── P10. Final service + firewall snapshot ─────────────────────────────
+    - name: POST | Final service state snapshot
+      ansible.windows.win_shell: |
+        $services = @(
+          '{{ scanvix_storm_mqtt_service_name }}',
+          '{{ scanvix_api_service_name }}'
+        )
+        foreach ($s in $services) {
+          $svc = Get-Service -Name $s -ErrorAction SilentlyContinue
+          if ($svc) {
+            Write-Output "$($svc.Name) : $($svc.Status)"
+          } else {
+            Write-Output "$s : NOT FOUND"
+          }
+        }
+      register: svc_snapshot
+      changed_when: false
+
+    - name: POST | Final firewall rules snapshot
+      ansible.windows.win_shell: |
+        $rules = @(
+          'StormEnergyRTU-API-8090',
+          'StormEnergyRTU-MQTT',
+          'StormEnergyRTU-TCP'
+        )
+        foreach ($r in $rules) {
+          $rule = Get-NetFirewallRule -DisplayName $r -ErrorAction SilentlyContinue
+          if ($rule) {
+            Write-Output "FW $($rule.DisplayName) : $($rule.Action) Enabled=$($rule.Enabled)"
+          } else {
+            Write-Output "FW $r : NOT FOUND"
+          }
+        }
+      register: fw_snapshot
+      changed_when: false
+
+    # ── P11. 14-Point Final Report ────────────────────────────────────────
+    - name: POST | ═══ GATE 2 FINAL REPORT ═══
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════════════╗
+          ║         Storm Energy RTU — Gate 2 Deployment Report                 ║
+          ║         Target: {{ ansible_host }} (scanvix109)                         ║
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  1. PYTHON STATUS                                                    ║
+          ║     {{ pre_venv.stdout | trim | truncate(64) }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  2. SQL STATUS                                                       ║
+          ║     {{ pre_db.stdout | trim | truncate(64) }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  3. MOSQUITTO STATUS (StormMosquitto broker)                         ║
+          ║     {{ port1883_check.stdout | trim | truncate(64) }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  4. API STATUS (StormEnergyRTU-API)                                  ║
+          ║     {{ svc_snapshot.stdout_lines | select('match','.*'+scanvix_api_service_name+'.*') | first | default('NOT REPORTED') | truncate(64) }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  5. MQTT CONSUMER STATUS                                             ║
+          ║     Running inside StormEnergyRTU-API (single-process architecture) ║
+          ║     No standalone MQTT service — consumer.py has no __main__ block  ║
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  6. TCP SERVER STATUS                                                ║
+          ║     Running inside StormEnergyRTU-API (single-process architecture) ║
+          ║     No standalone TCP service — server.py has no __main__ block     ║
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  7. PORT 8090 (FastAPI)                                              ║
+          ║     {{ port8090_check.stdout | trim | truncate(64) }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  8. PORT 1883 (StormMosquitto broker)                                ║
+          ║     {{ port1883_check.stdout | trim | truncate(64) }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║  9. PORT 9000 (TCP server)                                           ║
+          ║     {{ port9000_check.stdout | trim | truncate(64) }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║ 10. MQTT END-TO-END RESULT                                           ║
+          ║     Device : {{ mqtt_test_device }}
+          ║     Publish: {{ mqtt_publish.stdout_lines | select('match','MQTT_PUBLISH.*') | first | default('see above') | truncate(55) }}
+          ║     DB row : {{ mqtt_db_check.stdout_lines | first | default('see above') | truncate(55) }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║ 11. TCP END-TO-END RESULT                                            ║
+          ║     Device : {{ tcp_test_device }}
+          ║     Send   : {{ tcp_client_result.stdout_lines | first | default('skipped — no python on controller') | truncate(55) }}
+          ║     DB row : {{ tcp_db_check.stdout_lines | default(['skipped']) | first | truncate(55) }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║ 12. ALLIPURAM SERVICE BEFORE / AFTER                                 ║
+          ║     BEFORE: {{ pre_safety_before.stdout_lines | select('match','BEFORE_DEPLOY.*GoReceiver.*') | first | default('see pre_tasks') | truncate(55) }}
+          ║     AFTER : {{ post_safety.stdout_lines | select('match','AFTER_DEPLOY.*GoReceiver.*') | first | default('see post_tasks') | truncate(55) }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║ 13. PORT 8088 OWNER BEFORE / AFTER                                   ║
+          ║     BEFORE: {{ pre_safety_before.stdout_lines | select('match','BEFORE_DEPLOY.*8088.*') | first | default('see pre_tasks') | truncate(55) }}
+          ║     AFTER : {{ post_safety.stdout_lines | select('match','AFTER_DEPLOY.*8088.*') | first | default('see post_tasks') | truncate(55) }}
+          ║     {{ post_safety.stdout_lines | select('match','ALLIPURAM_MODIFIED.*') | first | default('(check post_safety task for detail)') }}
+          ╠══════════════════════════════════════════════════════════════════════╣
+          ║ 14. REMAINING SCANVIX PROTOCOL DEPENDENCIES                          ║
+          ║     a. ACK protocol: NullAckStrategy active — no ACK sent on TCP rx ║
+          ║        Final ACK format/timing to be agreed with Scanvix            ║
+          ║     b. Device ID scheme: confirm 'scanvix109' format with Scanvix   ║
+          ║     c. Telemetry schema: confirm field names match Scanvix firmware  ║
+          ║     d. TLS/mTLS: Mosquitto currently auth-only (no TLS) — TBD      ║
+          ║     e. Real device test: run mqtt_client.py / tcp_client.py with    ║
+          ║        device ID scanvix109 once device is physically available     ║
+          ╚══════════════════════════════════════════════════════════════════════╝
+
+  handlers:
+    - name: Restart Storm API
+      ansible.windows.win_service:
+        name: '{{ scanvix_api_service_name }}'
+        state: restarted

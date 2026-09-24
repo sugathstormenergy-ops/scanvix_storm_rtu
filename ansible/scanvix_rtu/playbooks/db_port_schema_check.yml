@@ -1,0 +1,144 @@
+---
+# READ-ONLY diagnostic — Check 1 (actual connection port/transport/auth) and
+# Check 2/3 (default schema resolution) against STORM_ENERGY_RTU.
+# Every statement below is a SELECT. No INSERT/UPDATE/DELETE/MERGE/CREATE/
+# ALTER/DROP/TRUNCATE/EXEC anywhere in this file. Does not run the database
+# role, does not run migrations, does not restart anything, does not touch
+# MQTT/firewall/ports/application files.
+#
+# Connects exactly like the proven-working inspection: Server=.\SQLEXPRESS,
+# Integrated Security=True, no explicit port — deliberately the SAME shape
+# as the successful diagnostic, so this reuses a connection method already
+# known to work rather than introducing a new one.
+#
+#   cd /mnt/e/scanvix_RTU/storm-energy-rtu/ansible/scanvix_rtu
+#   export ANSIBLE_ROLES_PATH="$(pwd)/roles"
+#   ansible-playbook -i inventory/hosts.ini playbooks/db_port_schema_check.yml --syntax-check
+#   ansible-playbook -i inventory/hosts.ini playbooks/db_port_schema_check.yml
+- name: Connectivity gate
+  hosts: scanvix109
+  gather_facts: false
+  tasks: [ { ansible.windows.win_ping: {} } ]
+
+- name: READ-ONLY port + schema diagnostic — STORM_ENERGY_RTU
+  hosts: scanvix109
+  gather_facts: false
+  vars:
+    scanvix_sql_instance:  '.\SQLEXPRESS'
+    scanvix_database_name: 'STORM_ENERGY_RTU'
+    svc_account_login:     'svc_ansible'   # bare name only — matches sys.database_principals.name convention
+
+  tasks:
+
+    - name: CHECK 1 — server/db identity, local TCP port, transport, protocol, auth scheme
+      check_mode: false
+      ansible.windows.win_shell: |
+        try {
+          $conn = New-Object System.Data.SqlClient.SqlConnection
+          $conn.ConnectionString = "Server={{ scanvix_sql_instance }};Database={{ scanvix_database_name }};Integrated Security=True;Connect Timeout=10"
+          $conn.Open()
+
+          $cmd1 = $conn.CreateCommand()
+          $cmd1.CommandText = "SELECT @@SERVERNAME AS ServerName, DB_NAME() AS DatabaseName, CONNECTIONPROPERTY('local_tcp_port') AS LocalTcpPort;"
+          $r1 = $cmd1.ExecuteReader()
+          while ($r1.Read()) {
+            $port = if ($r1.IsDBNull(2)) { "NULL (no TCP port -- see net_transport below)" } else { $r1.GetInt32(2) }
+            "ServerName=$($r1.GetString(0)) | DatabaseName=$($r1.GetString(1)) | LocalTcpPort=$port"
+          }
+          $r1.Close()
+
+          $cmd2 = $conn.CreateCommand()
+          $cmd2.CommandText = "SELECT net_transport, protocol_type, auth_scheme FROM sys.dm_exec_connections WHERE session_id = @@SPID;"
+          $r2 = $cmd2.ExecuteReader()
+          while ($r2.Read()) {
+            "net_transport=$($r2.GetString(0)) | protocol_type=$($r2.GetString(1)) | auth_scheme=$($r2.GetString(2))"
+          }
+          $r2.Close()
+          $conn.Close()
+        } catch {
+          "CHECK1_FAILED: $_"
+        }
+      register: check1
+      changed_when: false
+
+    - name: CHECK 2 — svc_ansible default schema + this diagnostic session's own current schema
+      check_mode: false
+      ansible.windows.win_shell: |
+        try {
+          $conn = New-Object System.Data.SqlClient.SqlConnection
+          $conn.ConnectionString = "Server={{ scanvix_sql_instance }};Database={{ scanvix_database_name }};Integrated Security=True;Connect Timeout=10"
+          $conn.Open()
+
+          $cmd1 = $conn.CreateCommand()
+          $cmd1.CommandText = "SELECT name, type_desc, default_schema_name FROM sys.database_principals WHERE name = '{{ svc_account_login }}';"
+          $r1 = $cmd1.ExecuteReader()
+          $found = $false
+          while ($r1.Read()) {
+            $found = $true
+            $schema = if ($r1.IsDBNull(2)) { "NULL" } else { $r1.GetString(2) }
+            "name=$($r1.GetString(0)) | type_desc=$($r1.GetString(1)) | default_schema_name=$schema"
+          }
+          if (-not $found) { "NOT_FOUND: no database principal named '{{ svc_account_login }}' in {{ scanvix_database_name }} (may only exist as a server login / Windows account without an explicit database user mapping)" }
+          $r1.Close()
+
+          $cmd2 = $conn.CreateCommand()
+          $cmd2.CommandText = "SELECT SCHEMA_NAME() AS CurrentSchema;"
+          $r2 = $cmd2.ExecuteReader()
+          while ($r2.Read()) {
+            "DIAGNOSTIC_SESSION_CurrentSchema=$($r2.GetString(0))  (NOTE: this is the schema for the account running THIS check over WinRM, not necessarily svc_ansible)"
+          }
+          $r2.Close()
+          $conn.Close()
+        } catch {
+          "CHECK2_FAILED: $_"
+        }
+      register: check2
+      changed_when: false
+
+    - name: CHECK 3 (optional) — explicit vs unqualified DeviceEvents resolution
+      check_mode: false
+      ansible.windows.win_shell: |
+        try {
+          $conn = New-Object System.Data.SqlClient.SqlConnection
+          $conn.ConnectionString = "Server={{ scanvix_sql_instance }};Database={{ scanvix_database_name }};Integrated Security=True;Connect Timeout=10"
+          $conn.Open()
+
+          $cmd1 = $conn.CreateCommand()
+          $cmd1.CommandText = "SELECT OBJECT_SCHEMA_NAME(OBJECT_ID('dbo.DeviceEvents')) AS ExplicitSchema, OBJECT_NAME(OBJECT_ID('dbo.DeviceEvents')) AS ExplicitTable;"
+          $r1 = $cmd1.ExecuteReader()
+          while ($r1.Read()) {
+            $s = if ($r1.IsDBNull(0)) { "NULL" } else { $r1.GetString(0) }
+            $t = if ($r1.IsDBNull(1)) { "NULL" } else { $r1.GetString(1) }
+            "ExplicitSchema=$s | ExplicitTable=$t"
+          }
+          $r1.Close()
+
+          $cmd2 = $conn.CreateCommand()
+          $cmd2.CommandText = "SELECT OBJECT_SCHEMA_NAME(OBJECT_ID('DeviceEvents')) AS ResolvedSchema, OBJECT_NAME(OBJECT_ID('DeviceEvents')) AS ResolvedTable;"
+          $r2 = $cmd2.ExecuteReader()
+          while ($r2.Read()) {
+            $s = if ($r2.IsDBNull(0)) { "NULL" } else { $r2.GetString(0) }
+            $t = if ($r2.IsDBNull(1)) { "NULL" } else { $r2.GetString(1) }
+            "ResolvedSchema=$s | ResolvedTable=$t  (NOTE: unqualified OBJECT_ID resolution follows the DIAGNOSTIC session's principal, same caveat as CurrentSchema above)"
+          }
+          $r2.Close()
+          $conn.Close()
+        } catch {
+          "CHECK3_FAILED: $_"
+        }
+      register: check3
+      changed_when: false
+
+    - name: FINAL REPORT
+      ansible.builtin.debug:
+        msg:
+          - "=== A/B/C/D -- CHECK 1: connection port, transport, protocol, auth scheme ==="
+          - "{{ check1.stdout_lines }}"
+          - ""
+          - "=== E/F -- CHECK 2: svc_ansible default schema + diagnostic session's own current schema ==="
+          - "{{ check2.stdout_lines }}"
+          - ""
+          - "=== G/H -- CHECK 3: explicit dbo.DeviceEvents vs unqualified DeviceEvents resolution ==="
+          - "{{ check3.stdout_lines }}"
+          - ""
+          - "=== NO DATABASE CHANGES MADE -- every statement above is SELECT-only ==="

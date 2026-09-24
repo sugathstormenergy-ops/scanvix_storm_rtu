@@ -1,0 +1,128 @@
+---
+# Storm Energy RTU — ONE controlled localhost TCP test to verify the
+# deployed IST timezone changes, plus BEFORE/AFTER + log evidence.
+#
+# Read-only except for: one legitimate TCP telemetry submission (the same
+# path a real RTU uses), which creates exactly one new Telemetry row via
+# auto-registration — no manual SQL INSERT, no schema change, no historical
+# row touched, nothing deleted.
+#
+# Run this AFTER playbooks/deploy_ist_timezone.yml has completed.
+
+- name: Storm Energy RTU — IST TCP verification
+  hosts: scanvix_rtu
+  gather_facts: false
+
+  tasks:
+    - name: IST VERIFY | Generate device ID and send ONE TCP telemetry packet to 127.0.0.1:9000
+      ansible.windows.win_shell: |
+        $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()
+        $deviceId = "99" + $epoch.Substring([Math]::Max(0,$epoch.Length-13)).PadLeft(13,'0')
+
+        $payload = @{
+          deviceId       = $deviceId
+          siteid         = "IST-DEPLOY-TEST"
+          ts             = "2026-09-01 14:30:00"
+          flow           = 12.34
+          flowUnit       = "m3/h"
+          totalToday     = 100.0
+          totalYesterday = 200.0
+          sensorType     = "rs485"
+          signalDbm      = -70
+          battery        = $null
+          fwVersion      = "1.0.0"
+          READ01 = $null; READ02 = $null; READ03 = $null; READ04 = $null; READ05 = $null
+          PRESSURE = $null
+        } | ConvertTo-Json -Compress
+
+        $client = New-Object System.Net.Sockets.TcpClient
+        $connected = $false
+        try {
+          $client.Connect("127.0.0.1", {{ scanvix_tcp_port }})
+          $connected = $client.Connected
+          $stream = $client.GetStream()
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+          $stream.Write($bytes, 0, $bytes.Length)
+          $stream.Flush()
+          Start-Sleep -Milliseconds 800
+          $ack = "NONE"
+          if ($stream.DataAvailable) {
+            $buf = New-Object byte[] 256
+            $n = $stream.Read($buf, 0, $buf.Length)
+            $ack = [System.Text.Encoding]::UTF8.GetString($buf, 0, $n)
+          }
+        } finally {
+          $client.Close()
+        }
+
+        Write-Output "DEVICE_ID: $deviceId"
+        Write-Output "TCP_CONNECTED: $connected"
+        Write-Output "ACK: $ack"
+        Write-Output "PAYLOAD_SENT: $payload"
+      register: tcp_test
+      changed_when: true
+
+    - name: IST VERIFY | TCP test result
+      ansible.builtin.debug:
+        msg: "{{ tcp_test.stdout_lines }}"
+
+    - name: IST VERIFY | Extract device id from previous task output
+      ansible.builtin.set_fact:
+        ist_device_id: "{{ tcp_test.stdout | regex_search('DEVICE_ID: (\\d+)', '\\1') | first }}"
+
+    - name: IST VERIFY | Wait for ingestion to complete
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: IST VERIFY | Query the new Telemetry row for this test device
+      ansible.windows.win_shell: |
+        $conn = New-Object System.Data.SqlClient.SqlConnection
+        $conn.ConnectionString = "Server={{ scanvix_sql_instance }};Database={{ scanvix_database_name }};Integrated Security=True;Connect Timeout=10"
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = "SELECT TOP 1 Id, DeviceId, [Timestamp], ReceivedAt FROM dbo.Telemetry WHERE DeviceId = '{{ ist_device_id }}' ORDER BY Id DESC"
+        $rdr = $cmd.ExecuteReader()
+        if ($rdr.Read()) {
+          Write-Output ("Id="        + $rdr["Id"])
+          Write-Output ("DeviceId="  + $rdr["DeviceId"])
+          Write-Output ("Timestamp(RTU ts, unchanged)=" + $rdr["Timestamp"])
+          Write-Output ("ReceivedAt(server, should be IST)=" + $rdr["ReceivedAt"])
+        } else {
+          Write-Output "NO_ROW_FOUND for device {{ ist_device_id }}"
+        }
+        $rdr.Close(); $conn.Close()
+      register: db_row
+      changed_when: false
+
+    - name: IST VERIFY | Telemetry row (DB evidence)
+      ansible.builtin.debug:
+        msg: "{{ db_row.stdout_lines }}"
+
+    - name: IST VERIFY | Current server clock — UTC and IST, for comparison
+      ansible.windows.win_shell: |
+        $utcNow = [DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm:ss")
+        $istZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("India Standard Time")
+        $istNow = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $istZone).ToString("yyyy-MM-dd HH:mm:ss")
+        Write-Output "Server UTC now: $utcNow"
+        Write-Output "Server IST now (for comparison only): $istNow"
+      register: clock_ref
+      changed_when: false
+
+    - name: IST VERIFY | Clock reference
+      ansible.builtin.debug:
+        msg: "{{ clock_ref.stdout_lines }}"
+
+    - name: IST VERIFY | Tail application log for this device's IST-timestamped line(s)
+      ansible.windows.win_shell: |
+        $log = '{{ scanvix_logs_dir }}\api_stdout.log'
+        if (Test-Path $log) {
+          Select-String -Path $log -Pattern '{{ ist_device_id }}' | Select-Object -Last 10 | ForEach-Object { $_.Line }
+        } else {
+          Write-Output "LOG_NOT_FOUND: $log"
+        }
+      register: log_tail
+      changed_when: false
+
+    - name: IST VERIFY | Log lines for test device (sample IST timestamp evidence)
+      ansible.builtin.debug:
+        msg: "{{ log_tail.stdout_lines | default(['(no matching log lines found)']) }}"

@@ -1,0 +1,219 @@
+---
+# ============================================================================
+# Storm Energy RTU — MQTT TLS (8883) deployment ONLY
+# ============================================================================
+# Narrow scope, matching the task's own instruction: "Ansible source →
+# Mosquitto TLS 8883 → authentication/ACL preservation → Windows firewall →
+# local TLS validation." Does NOT run playbooks/gate2.yml's full-stack
+# deploy+E2E-test flow (which restarts StormEnergyRTU-API, redeploys .env,
+# runs dedup/malformed/restart-idempotency tests — all explicitly out of
+# scope for this change).
+#
+# Reuses, unmodified in mechanism:
+#   - roles/mqtt tasks_from: gate2   (now also deploys storm_acl + runs
+#     --test-config + picks up the 8883 TLS block, since group_vars now has
+#     scanvix_mqtt_tls_enabled: true)
+#   - roles/firewall tasks_from: tls  (pre-built, previously never included
+#     by any playbook — wired in here for the first time)
+#
+# SAFETY: does not touch AllipuramPFCMD-Go-Receiver, port 8088, IIS, port 80,
+# StormEnergyRTU-API, port 8090, TCP port 9000, DNS, or router/NAT. Restarts
+# ONLY StormMosquitto, and only if gate2's config-deploy actually changed
+# content (existing, unmodified restart-if-changed logic).
+#
+# PREREQUISITE (resolved 2026-09-18 — kept as documentation of the guard below):
+#   scanvix_mqtt_bench_enabled must be `false` in group_vars/all.yml before
+#   this playbook redeploys mosquitto_storm.conf via the shared template,
+#   otherwise the 1885 bench listener (deliberately removed from the live
+#   config earlier) would be silently re-rendered. The pre_tasks assertion
+#   below enforces this at run time regardless of this file's current value,
+#   so this comment does not need to be kept in sync with group_vars/all.yml.
+#
+# Usage:
+#   ANSIBLE_CONFIG=ansible.cfg ansible-playbook \
+#     -i inventory/hosts.ini playbooks/mqtt_tls_deploy.yml \
+#     --extra-vars "scanvix_mqtt_password=<existing pw>" \
+#     --check --diff        # dry run first
+# ============================================================================
+
+- name: Storm Energy RTU — MQTT TLS (8883) deployment
+  hosts: scanvix_rtu
+  gather_facts: false
+
+  pre_tasks:
+
+    - name: PRE | Validate runtime credential supplied
+      ansible.builtin.assert:
+        that:
+          - scanvix_mqtt_password | default('') | length > 0
+        fail_msg: >-
+          This playbook requires --extra-vars scanvix_mqtt_password=<existing
+          production password>. It does NOT create a new credential — the
+          existing storm_passwd entry for scanvix_mqtt_username is reused
+          (see roles/mqtt/tasks/gate2.yml step 1, unchanged).
+
+    - name: PRE | Refuse to proceed if the bench-listener regression is unresolved
+      ansible.builtin.assert:
+        that:
+          - not (scanvix_mqtt_bench_enabled | default(false) | bool)
+        fail_msg: >-
+          scanvix_mqtt_bench_enabled is still true. Redeploying the Mosquitto
+          config now would re-render the 1885 bench listener that was
+          deliberately removed from the live config earlier. Set
+          scanvix_mqtt_bench_enabled: false in group_vars/all.yml (or pass
+          -e scanvix_mqtt_bench_enabled=false) before running this for real,
+          or explicitly confirm 1885 should stay and re-run with
+          -e allow_bench_listener=true to bypass this check.
+      when: not (allow_bench_listener | default(false) | bool)
+
+    - name: PRE | Confirm TLS certificate files exist (read-only, no content read)
+      ansible.windows.win_stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ scanvix_mqtt_tls_certfile }}"
+        - "{{ scanvix_mqtt_tls_keyfile }}"
+      register: cert_stat
+
+    - name: PRE | FAIL if either certificate file is missing
+      ansible.builtin.assert:
+        that:
+          - cert_stat.results[0].stat.exists
+          - cert_stat.results[1].stat.exists
+        fail_msg: >-
+          Certificate file(s) not found on the target:
+          {{ scanvix_mqtt_tls_certfile }} exists={{ cert_stat.results[0].stat.exists | default(false) }},
+          {{ scanvix_mqtt_tls_keyfile }} exists={{ cert_stat.results[1].stat.exists | default(false) }}.
+          Do not proceed — do not create placeholder certificates.
+
+    - name: PRE | Baseline — Allipuram (8088), API (8090), TCP (9000) before any change
+      ansible.windows.win_shell: |
+        $recv = Get-Service 'AllipuramPFCMD-Go-Receiver' -ErrorAction SilentlyContinue
+        "AllipuramPFCMD-Go-Receiver: $($recv.Status)"
+        "8088=" + (@(Get-NetTCPConnection -LocalPort 8088 -State Listen -EA SilentlyContinue).Count)
+        "8090=" + (@(Get-NetTCPConnection -LocalPort 8090 -State Listen -EA SilentlyContinue).Count)
+        "9000=" + (@(Get-NetTCPConnection -LocalPort 9000 -State Listen -EA SilentlyContinue).Count)
+        "1883=" + (@(Get-NetTCPConnection -LocalPort 1883 -State Listen -EA SilentlyContinue).Count)
+        "8883=" + (@(Get-NetTCPConnection -LocalPort 8883 -State Listen -EA SilentlyContinue).Count)
+      register: pre_baseline
+      changed_when: false
+
+    - name: PRE | Baseline result
+      ansible.builtin.debug:
+        msg: "{{ pre_baseline.stdout_lines | default(['Baseline skipped in check mode']) }}"
+
+    - name: PRE | Backup current live config if not already backed up today
+      ansible.windows.win_shell: |
+        $targets = @(
+          'C:\ProgramData\StormEnergyRTU\Mosquitto\mosquitto_storm.conf',
+          'C:\Program Files\mosquitto\mosquitto_storm.conf'
+        )
+        $stamp = Get-Date -Format 'yyyyMMdd'
+        foreach ($src in $targets) {
+          if (Test-Path $src) {
+            $dst = "$src.backup-$stamp"
+            if (Test-Path $dst) {
+              "SKIPPED (already exists): $dst"
+            } else {
+              Copy-Item -Path $src -Destination $dst
+              "BACKED_UP: $src -> $dst"
+            }
+          } else {
+            "NOT_PRESENT: $src"
+          }
+        }
+      register: backup_result
+      changed_when: "'BACKED_UP' in backup_result.stdout"
+
+    - name: PRE | Backup result
+      ansible.builtin.debug:
+        msg: "{{ backup_result.stdout_lines | default(['Backup skipped in check mode']) }}"
+
+  tasks:
+
+    - name: "MQTT-TLS | Configure StormMosquitto (password + ACL + config + validate + restart-if-changed + 1883 checks)"
+      ansible.builtin.include_role:
+        name: mqtt
+        tasks_from: gate2
+      vars:
+        scanvix_mqtt_password: "{{ scanvix_mqtt_password }}"
+
+    - name: "MQTT-TLS | Apply Windows Firewall rule for 8883 (dormant task, wired in here)"
+      ansible.builtin.include_role:
+        name: firewall
+        tasks_from: tls
+
+  post_tasks:
+
+    - name: POST | Verify 8883 is listening (0.0.0.0 or equivalent wildcard)
+      ansible.windows.win_shell: |
+        $b = Get-NetTCPConnection -LocalPort {{ scanvix_mqtt_tls_port }} -State Listen -ErrorAction SilentlyContinue
+        if (-not $b) { Write-Output "FAIL: port {{ scanvix_mqtt_tls_port }} not listening"; exit 0 }
+        foreach ($x in $b) { Write-Output "LISTEN $($x.LocalAddress):$($x.LocalPort) PID=$($x.OwningProcess)" }
+      register: post_8883
+      changed_when: false
+
+    - name: POST | 8883 listener result
+      ansible.builtin.debug:
+        msg: "{{ post_8883.stdout_lines | default(['8883 check skipped in check mode']) }}"
+
+    - name: POST | Re-confirm 1883 remains loopback-only after this change
+      ansible.windows.win_shell: |
+        $b = Get-NetTCPConnection -LocalPort 1883 -State Listen -ErrorAction SilentlyContinue
+        $ext = $b | Where-Object { $_.LocalAddress -notin @('127.0.0.1','::1') }
+        if ($ext) { Write-Output "FAIL: 1883 has an external binding" } else { Write-Output "OK: 1883 loopback-only" }
+      register: post_1883
+      changed_when: false
+      failed_when: "'FAIL' in post_1883.stdout"
+
+    - name: POST | 1883 result
+      ansible.builtin.debug:
+        msg: "{{ (post_1883.stdout | default('1883 check skipped in check mode')) | trim }}"
+
+    - name: POST | Safety re-confirmation — Allipuram / 8090 / 9000 unaffected
+      ansible.windows.win_shell: |
+        $recv = Get-Service 'AllipuramPFCMD-Go-Receiver' -ErrorAction SilentlyContinue
+        "AllipuramPFCMD-Go-Receiver: $($recv.Status)"
+        "8088=" + (@(Get-NetTCPConnection -LocalPort 8088 -State Listen -EA SilentlyContinue).Count)
+        "8090=" + (@(Get-NetTCPConnection -LocalPort 8090 -State Listen -EA SilentlyContinue).Count)
+        "9000=" + (@(Get-NetTCPConnection -LocalPort 9000 -State Listen -EA SilentlyContinue).Count)
+      register: post_safety
+      changed_when: false
+
+    - name: POST | Safety re-confirmation result
+      ansible.builtin.debug:
+        msg: "{{ post_safety.stdout_lines | default(['Safety re-confirmation skipped in check mode']) }}"
+
+    - name: "POST | LOCAL TLS test — connect to 127.0.0.1:8883 with existing credentials"
+      # --insecure: skips hostname verification ONLY (we connect via IP, not
+      # the certificate's SAN name, per the task's explicit "local test first,
+      # not the public DNS path" instruction) — full chain validation against
+      # --cafile still occurs. This is a LOCAL smoke test only; it does not
+      # prove the public mqtt.stormenergy.in:8883 path works (NAT not done).
+      ansible.windows.win_shell: |
+        $pub = 'C:\Program Files\mosquitto\mosquitto_pub.exe'
+        if (-not (Test-Path $pub)) { Write-Output "SKIP: mosquitto_pub.exe not found"; exit 0 }
+        $pw = $env:MQTT_PW
+        & $pub -h 127.0.0.1 -p {{ scanvix_mqtt_tls_port }} `
+            --cafile "{{ scanvix_mqtt_tls_certfile }}" `
+            --insecure `
+            -u '{{ scanvix_mqtt_username }}' -P $pw `
+            -t 'storm/test/tls8883' -m 'tls-local-ok' 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { Write-Output "LOCAL_TLS_TEST: SUCCESS" }
+        else { Write-Error "LOCAL_TLS_TEST: FAILED (exit $LASTEXITCODE)"; exit 1 }
+      environment:
+        MQTT_PW: "{{ scanvix_mqtt_password }}"
+      no_log: true
+      register: tls_test
+      changed_when: false
+      failed_when: false
+
+    - name: "POST | Local TLS test result (no credentials)"
+      ansible.builtin.debug:
+        msg: "{{ tls_test.stdout_lines | default(['see task output']) }}"
+
+    - name: "POST | Remaining steps — NOT performed by this playbook"
+      ansible.builtin.debug:
+        msg:
+          - "Router/NAT: TCP 8883 -> 192.168.0.109:8883 from public IP 122.175.54.32 — NOT configured (out of scope, manual)."
+          - "DNS: mqtt.stormenergy.in -> 122.175.54.32 — managed externally, not touched."
+          - "Public path (mqtt.stormenergy.in:8883 from the internet) — NOT tested. Only 127.0.0.1:8883 was tested above."

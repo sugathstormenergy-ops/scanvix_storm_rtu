@@ -1,0 +1,456 @@
+---
+# Storm Energy RTU -- Python Role
+# Installs Python 3.12 (machine-scope) if not present,
+# then creates a dedicated venv at E:\StormEnergyRTU.venv.
+#
+# Does NOT modify any existing Python installation or venv.
+# Does NOT use the Microsoft Store WindowsApps Python execution alias.
+#
+# WinRM COMPATIBILITY NOTE:
+# AppX-installed winget (C:\Program Files\WindowsApps\...\winget.exe) returns
+# "Access is denied" when invoked from the WinRM service-account context even
+# when the executable is discoverable.  This role tests actual execution before
+# accepting any winget as usable and explicitly reports "FOUND BUT NOT
+# WinRM-EXECUTABLE" for the AppX case.
+#
+# Installer priority (first match wins):
+#   1. Chocolatey (choco.exe)              -- WinRM-compatible
+#   2. Pre-staged Python installer         -- E:\StormEnergyRTU\scripts\python-installer\
+#   3. winget on PATH (non-AppX, verified) -- execution tested, AppX excluded
+# If none is available the role fails with actionable instructions.
+
+# -- Step 1: detect existing Python 3.12 ------------------------------------
+
+- name: PYTHON | Check for Python 3.12 at machine-scope path
+  ansible.windows.win_stat:
+    path: 'C:\Program Files\Python312\python.exe'
+  register: py312_stat
+
+# Read-only PATH check: only needed when 3.12 is not at the default path.
+# Explicitly rejects the WindowsApps Store alias (it prints a Store prompt,
+# not an actual Python version).
+- name: PYTHON | Check for real Python on PATH (not WindowsApps stub)
+  check_mode: false
+  ansible.windows.win_shell: |
+    $py = Get-Command python.exe -ErrorAction SilentlyContinue
+    if (-not $py) { Write-Output "PATH_PYTHON: NOT_FOUND"; exit 0 }
+    if ($py.Source -like '*WindowsApps*') {
+      Write-Output "PATH_PYTHON: NOT_FOUND (WindowsApps Store alias rejected: $($py.Source))"
+      exit 0
+    }
+    $v = & $py.Source --version 2>&1
+    if ($LASTEXITCODE -ne 0 -or "$v" -notmatch 'Python 3\.') {
+      Write-Output "PATH_PYTHON: NOT_FOUND (non-zero exit or bad version string: $v)"
+      exit 0
+    }
+    Write-Output "PATH_PYTHON: $v"
+  register: py_path_check
+  changed_when: false
+  failed_when: false
+  when: not py312_stat.stat.exists
+
+# -- Step 2: detect WinRM-compatible installation mechanism -----------------
+# Runs in both real and check mode (detection is read-only).
+#
+# Priority order:
+#   1. Chocolatey (choco.exe on service-account PATH)
+#   2. Pre-staged Python 3.12 installer in Storm scripts directory
+#   3. winget -- PATH-only, actual execution tested; AppX treated as APPX_DENIED
+#
+# Output tokens (parsed by subsequent tasks):
+#   CHOCO_STATUS:FOUND|NOT_FOUND
+#   STAGED_STATUS:FOUND:<path>|NOT_FOUND
+#   WINGET_STATUS:EXECUTABLE:<path>|APPX_DENIED|EXEC_FAILED|NOT_FOUND
+#   INSTALLER:CHOCO|MSI|WINGET|NONE
+#   INSTALLER_EXE:<path>   (when INSTALLER != NONE)
+#   INSTALLER_VER:<ver>    (when INSTALLER != NONE)
+
+- name: PYTHON | Detect WinRM-compatible installer for Python 3.12
+  check_mode: false
+  ansible.windows.win_shell: |
+    # ---- Priority 1: Chocolatey ----
+    $choco = Get-Command choco.exe -ErrorAction SilentlyContinue
+    if ($choco) {
+      $ver = & $choco.Source --version 2>&1
+      if ($LASTEXITCODE -eq 0) {
+        Write-Output "CHOCO_STATUS:FOUND"
+        Write-Output "INSTALLER:CHOCO"
+        Write-Output "INSTALLER_EXE:$($choco.Source)"
+        Write-Output "INSTALLER_VER:$($ver -join ' ')"
+        exit 0
+      }
+    }
+    Write-Output "CHOCO_STATUS:NOT_FOUND"
+
+    # ---- Priority 2: Pre-staged Python installer ----
+    $staged = @(
+      'E:\StormEnergyRTU\scripts\python-installer\python-3.12-amd64.exe',
+      'E:\StormEnergyRTU\scripts\python312-setup.exe'
+    )
+    $foundStaged = $null
+    foreach ($s in $staged) {
+      if (Test-Path $s) { $foundStaged = $s; break }
+    }
+    if ($foundStaged) {
+      Write-Output "STAGED_STATUS:FOUND:$foundStaged"
+      Write-Output "INSTALLER:MSI"
+      Write-Output "INSTALLER_EXE:$foundStaged"
+      Write-Output "INSTALLER_VER:pre-staged"
+      exit 0
+    }
+    Write-Output "STAGED_STATUS:NOT_FOUND"
+
+    # ---- Priority 3: winget -- test actual execution, AppX distinguished ----
+    # Get-Command may return the AppX alias; we must test that it actually runs.
+    $wgCmd = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if (-not $wgCmd) {
+      Write-Output "WINGET_STATUS:NOT_FOUND"
+      Write-Output "INSTALLER:NONE"
+      exit 0
+    }
+    $wgPath = $wgCmd.Source
+    $isAppX = ($wgPath -like '*WindowsApps*') -or ($wgPath -like '*AppData*Microsoft*WindowsApps*')
+    $testOut = & $wgPath --version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      if ($isAppX) {
+        Write-Output "WINGET_STATUS:APPX_DENIED"
+      } else {
+        Write-Output "WINGET_STATUS:EXEC_FAILED"
+      }
+      Write-Output "INSTALLER:NONE"
+      exit 0
+    }
+    # winget actually executed -- accept it only when NOT AppX
+    # (AppX succeeding from WinRM is rare but handle it)
+    if ($isAppX) {
+      # AppX winget ran -- but this is the alias; treat as usable only if
+      # version output looks legitimate, which means it is actually working.
+      Write-Output "WINGET_STATUS:APPX_EXECUTABLE:$wgPath"
+    } else {
+      Write-Output "WINGET_STATUS:EXECUTABLE:$wgPath"
+    }
+    Write-Output "INSTALLER:WINGET"
+    Write-Output "INSTALLER_EXE:$wgPath"
+    Write-Output "INSTALLER_VER:$($testOut -join ' ')"
+    exit 0
+  register: installer_detect
+  changed_when: false
+  failed_when: false
+  when:
+    - not py312_stat.stat.exists
+    - py_path_check.stdout is defined
+    - "'NOT_FOUND' in py_path_check.stdout"
+
+# Show the raw detection tokens so the operator can see exactly what was found.
+- name: PYTHON | Installer detection report
+  ansible.builtin.debug:
+    msg: "{{ installer_detect.stdout_lines | default(['(detection skipped -- Python 3.12 already installed)']) }}"
+
+# Fail when no mechanism is available -- fires in check mode too so the
+# blocker is surfaced without needing a real run.
+- name: PYTHON | FAIL -- no WinRM-compatible installer found
+  ansible.builtin.fail:
+    msg:
+      - "Python 3.12 is not installed and no WinRM-compatible installer is available."
+      - ""
+      - "Detected:"
+      - "  Python 3.12 at C:\\Program Files\\Python312\\: NOT_INSTALLED"
+      - "  Python on PATH:       {{ py_path_check.stdout | default('N/A') | trim }}"
+      - "  Chocolatey:           {{ (installer_detect.stdout_lines | default([]) | select('match','CHOCO_STATUS:') | list | first | default('CHOCO_STATUS:NOT_FOUND')) | regex_replace('^CHOCO_STATUS:','') }}"
+      - "  Pre-staged installer: {{ (installer_detect.stdout_lines | default([]) | select('match','STAGED_STATUS:') | list | first | default('STAGED_STATUS:NOT_FOUND')) | regex_replace('^STAGED_STATUS:','') }}"
+      - "  winget:               {{ (installer_detect.stdout_lines | default([]) | select('match','WINGET_STATUS:') | list | first | default('WINGET_STATUS:NOT_FOUND')) | regex_replace('^WINGET_STATUS:','') }}"
+      - ""
+      - "Choose one of the following before re-running Gate 1:"
+      - ""
+      - "  1. Stage the official Python 3.12 installer:"
+      - "       Download: https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
+      - "       Place at: E:\\StormEnergyRTU\\scripts\\python-installer\\python-3.12-amd64.exe"
+      - "     Gate 1 will install it silently machine-wide on the next run."
+      - ""
+      - "  2. Install Chocolatey on the server (run as administrator):"
+      - "       Set-ExecutionPolicy Bypass -Scope Process -Force"
+      - "       iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))"
+      - "     Gate 1 will then run: choco install python312 -y"
+      - ""
+      - "  3. Install Python 3.12 manually machine-wide:"
+      - "       Run the official installer as admin with InstallAllUsers=1."
+      - "       Verify: Test-Path 'C:\\Program Files\\Python312\\python.exe' returns True."
+      - "     Gate 1 will skip installation and proceed to venv setup."
+      - ""
+      - "Do NOT modify permissions on C:\\Program Files\\WindowsApps."
+  when:
+    - not py312_stat.stat.exists
+    - py_path_check.stdout is defined
+    - "'NOT_FOUND' in py_path_check.stdout"
+    - installer_detect is not skipped
+    - "'INSTALLER:NONE' in installer_detect.stdout"
+
+- name: PYTHON | Store installer details as facts
+  ansible.builtin.set_fact:
+    _scanvix_installer_method: >-
+      {{ installer_detect.stdout_lines
+         | select('match', 'INSTALLER:')
+         | reject('match', 'INSTALLER_EXE:')
+         | reject('match', 'INSTALLER_VER:')
+         | first
+         | regex_replace('^INSTALLER:', '') }}
+    _scanvix_installer_exe: >-
+      {{ installer_detect.stdout_lines
+         | select('match', 'INSTALLER_EXE:')
+         | first
+         | regex_replace('^INSTALLER_EXE:', '') }}
+  when:
+    - not py312_stat.stat.exists
+    - py_path_check.stdout is defined
+    - "'NOT_FOUND' in py_path_check.stdout"
+    - installer_detect is not skipped
+    - "'INSTALLER:NONE' not in installer_detect.stdout"
+
+# Check-mode notice: Python absent, installer detected, install skipped.
+- name: PYTHON | CHECK MODE -- installation would proceed on a real run
+  ansible.builtin.debug:
+    msg:
+      - "CHECK MODE: Python 3.12 is not present on this server."
+      - "Detected installer method: {{ _scanvix_installer_method | default('none') }}"
+      - "Installer path:            {{ _scanvix_installer_exe | default('none') }}"
+      - "A real run (without --check) will install Python 3.12 machine-wide."
+      - "All subsequent venv/pip/import tasks are skipped in check mode."
+  when:
+    - ansible_check_mode
+    - not py312_stat.stat.exists
+    - installer_detect is not skipped
+    - "'INSTALLER:NONE' not in (installer_detect.stdout | default(''))"
+
+# -- Step 2b: install Python 3.12 (mutations -- all skip in check mode) -----
+
+- name: PYTHON | Install Python 3.12 via Chocolatey
+  ansible.windows.win_shell: |
+    Write-Output "Installing Python 3.12 via Chocolatey: {{ _scanvix_installer_exe }}"
+    & '{{ _scanvix_installer_exe }}' install python312 -y --no-progress --limitoutput
+    if ($LASTEXITCODE -ne 0) {
+      Write-Error "choco install python312 failed (exit $LASTEXITCODE)"
+      exit 1
+    }
+    Write-Output "Python 3.12 installed successfully via Chocolatey"
+  register: py_install_choco
+  changed_when: true
+  when:
+    - not py312_stat.stat.exists
+    - not ansible_check_mode
+    - _scanvix_installer_method is defined
+    - _scanvix_installer_method == 'CHOCO'
+
+- name: PYTHON | Install Python 3.12 via pre-staged installer
+  ansible.windows.win_shell: |
+    $installer = '{{ _scanvix_installer_exe }}'
+    $logFile   = "$env:TEMP\python312_install.log"
+    Write-Output "PYTHON_INSTALLER: $installer"
+    Write-Output "PYTHON_INSTALL_LOG: $logFile"
+
+    # Use Start-Process -Wait -PassThru so we capture the REAL exit code.
+    # Direct & invocation loses $LASTEXITCODE when the installer spawns msiexec
+    # as a child process and returns before the child finishes.
+    # Pass all arguments as a single string; Windows (CreateProcess) will parse
+    # them with CommandLineToArgvW and the Python installer will receive them.
+    $argString = "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 " +
+                 "TargetDir=`"C:\Program Files\Python312`" " +
+                 "/log `"$logFile`""
+
+    Write-Output "PYTHON_INSTALL_ARGS: $argString"
+
+    $proc = Start-Process `
+        -FilePath    $installer `
+        -ArgumentList $argString `
+        -Wait `
+        -PassThru `
+        -WindowStyle Hidden
+
+    $exitCode = $proc.ExitCode
+    Write-Output "PYTHON_INSTALL_EXIT_CODE: $exitCode"
+
+    if ($exitCode -eq 0) {
+      Write-Output "Python 3.12 installed successfully (exit 0)."
+    } elseif ($exitCode -eq 3010) {
+      Write-Output "Python 3.12 installed successfully; reboot recommended but NOT required for Ansible use (exit 3010)."
+    } else {
+      $logTail = if (Test-Path $logFile) {
+        (Get-Content $logFile -Tail 30) -join " | "
+      } else { "(no log file found)" }
+      Write-Error ("Python installer FAILED. " +
+                   "Installer=$installer | " +
+                   "ExitCode=$exitCode | " +
+                   "Log=$logFile | " +
+                   "LogTail=$logTail")
+      exit 1
+    }
+  register: py_install_msi
+  changed_when: true
+  when:
+    - not py312_stat.stat.exists
+    - not ansible_check_mode
+    - _scanvix_installer_method is defined
+    - _scanvix_installer_method == 'MSI'
+
+- name: PYTHON | Install Python 3.12 via winget
+  ansible.windows.win_shell: |
+    Write-Output "Installing Python 3.12 via winget: {{ _scanvix_installer_exe }}"
+    & '{{ _scanvix_installer_exe }}' install `
+        --id Python.Python.3.12 `
+        --scope machine `
+        --silent `
+        --accept-package-agreements `
+        --accept-source-agreements
+    if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
+      Write-Error "winget install Python.Python.3.12 failed (exit $LASTEXITCODE)"
+      exit 1
+    }
+    Write-Output "Python 3.12 installed successfully via winget"
+  register: py_install_winget
+  changed_when: true
+  when:
+    - not py312_stat.stat.exists
+    - not ansible_check_mode
+    - _scanvix_installer_method is defined
+    - _scanvix_installer_method == 'WINGET'
+
+- name: PYTHON | Installation result
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        (py_install_choco.stdout_lines  | default([])) +
+        (py_install_msi.stdout_lines    | default([])) +
+        (py_install_winget.stdout_lines | default([]))
+        | default(['Python already present or installation skipped in check mode'])
+      }}
+  when: not py312_stat.stat.exists
+
+# -- Step 3: locate python.exe -----------------------------------------------
+# Guard: skip in --check mode when Python is not already installed.
+#   - check mode + Python already installed: runs (check_mode: false ensures it)
+#   - check mode + Python absent:            SKIPPED (winget was skipped -- Python still absent)
+#   - real execution:                        always runs
+# WindowsApps alias is never used: only Program Files\Python3xx paths are checked.
+
+- name: PYTHON | Locate python.exe after install
+  check_mode: false
+  ansible.windows.win_shell: |
+    $candidates = @(
+      'C:\Program Files\Python312\python.exe',
+      'C:\Program Files\Python311\python.exe',
+      'C:\Program Files\Python313\python.exe'
+    )
+    foreach ($c in $candidates) {
+      if (Test-Path $c) {
+        $v = & $c --version 2>&1
+        if ($LASTEXITCODE -eq 0 -and "$v" -match 'Python 3\.') {
+          Write-Output "PYTHON_EXE:$c"
+          Write-Output "PYTHON_VER:$v"
+          exit 0
+        }
+      }
+    }
+    Write-Error "Python 3.x not found in Program Files. winget install may have failed or a PATH refresh is needed."
+    exit 1
+  register: py_locate
+  changed_when: false
+  failed_when: py_locate.rc != 0
+  when: not ansible_check_mode or py312_stat.stat.exists
+
+- name: PYTHON | Python executable found
+  ansible.builtin.debug:
+    msg: "{{ py_locate.stdout_lines | default(['(Python locate skipped in check mode -- Python not yet installed)']) }}"
+
+- name: PYTHON | Extract python.exe path as fact
+  ansible.builtin.set_fact:
+    _scanvix_python_exe: >-
+      {{ py_locate.stdout_lines
+         | select('match', 'PYTHON_EXE:')
+         | first
+         | regex_replace('^PYTHON_EXE:', '') }}
+  when: not ansible_check_mode or py312_stat.stat.exists
+
+- name: PYTHON | Confirm resolved python.exe
+  ansible.builtin.debug:
+    msg: "Using python.exe: {{ _scanvix_python_exe | default('(not resolved -- check mode, Python not installed)') }}"
+
+# -- Step 4: create venv (mutation) ------------------------------------------
+# Guard: same condition as py_locate.
+
+- name: PYTHON | Create virtual environment (idempotent)
+  ansible.windows.win_shell: |
+    if (Test-Path '{{ scanvix_venv_dir }}\Scripts\python.exe') {
+      Write-Output "Venv already exists"
+    } else {
+      & '{{ _scanvix_python_exe }}' -m venv '{{ scanvix_venv_dir }}'
+      if ($LASTEXITCODE -ne 0) { Write-Error "venv creation failed"; exit 1 }
+      Write-Output "Venv created"
+    }
+  register: venv_create
+  changed_when: "'created' in venv_create.stdout"
+  when: not ansible_check_mode or py312_stat.stat.exists
+
+- name: PYTHON | Venv result
+  ansible.builtin.debug:
+    msg: "{{ venv_create.stdout_lines | default(['(venv creation skipped in check mode)']) }}"
+
+# -- Step 5: install requirements (mutations) --------------------------------
+# requirements.txt is staged FROM the Ansible controller (same convention as
+# the database role which copies SQL scripts via win_copy src: playbook_dir).
+# scanvix_source_dir is the WINDOWS target path used by later gates (storm_rtu
+# robocopy); it does NOT exist on .109 at Gate 1 time.
+# Staged destination: E:\StormEnergyRTU\app\requirements.txt (idempotent).
+# Using scanvix_app_dir keeps requirements alongside the eventual app source.
+
+- name: PYTHON | Upgrade pip in venv
+  ansible.windows.win_shell: |
+    & '{{ scanvix_venv_python }}' -m pip install --upgrade pip --quiet
+  changed_when: false
+  when: not ansible_check_mode or py312_stat.stat.exists
+
+- name: PYTHON | Stage requirements.txt from controller to Windows target
+  ansible.windows.win_copy:
+    src: "{{ playbook_dir }}/../../../backend/requirements.txt"
+    dest: '{{ scanvix_app_dir }}\requirements.txt'
+  when: not ansible_check_mode or py312_stat.stat.exists
+
+- name: PYTHON | Install application requirements
+  ansible.windows.win_shell: |
+    & '{{ scanvix_pip_exe }}' install -r '{{ scanvix_app_dir }}\requirements.txt' --quiet
+    if ($LASTEXITCODE -ne 0) { Write-Error "pip install failed"; exit 1 }
+    Write-Output "Requirements installed"
+  register: pip_install
+  changed_when: true
+  when: not ansible_check_mode or py312_stat.stat.exists
+
+# -- Step 6: verify imports --------------------------------------------------
+
+- name: PYTHON | Verify FastAPI importable
+  ansible.windows.win_shell: |
+    & '{{ scanvix_venv_python }}' -c "import fastapi; print('fastapi OK', fastapi.__version__)"
+  register: fastapi_check
+  changed_when: false
+  failed_when: fastapi_check.rc != 0
+  when: not ansible_check_mode or py312_stat.stat.exists
+
+- name: PYTHON | Verify SQLAlchemy importable
+  ansible.windows.win_shell: |
+    & '{{ scanvix_venv_python }}' -c "import sqlalchemy; print('sqlalchemy OK', sqlalchemy.__version__)"
+  register: sqla_check
+  changed_when: false
+  failed_when: sqla_check.rc != 0
+  when: not ansible_check_mode or py312_stat.stat.exists
+
+- name: PYTHON | Verify pyodbc importable
+  ansible.windows.win_shell: |
+    & '{{ scanvix_venv_python }}' -c "import pyodbc; print('pyodbc OK', pyodbc.version)"
+  register: pyodbc_check
+  changed_when: false
+  failed_when: pyodbc_check.rc != 0
+  when: not ansible_check_mode or py312_stat.stat.exists
+
+- name: PYTHON | Import verification summary
+  ansible.builtin.debug:
+    msg:
+      - "{{ fastapi_check.stdout | default('(skipped -- venv not yet created)') | trim }}"
+      - "{{ sqla_check.stdout | default('(skipped -- venv not yet created)') | trim }}"
+      - "{{ pyodbc_check.stdout | default('(skipped -- venv not yet created)') | trim }}"

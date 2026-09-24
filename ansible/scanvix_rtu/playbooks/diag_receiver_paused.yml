@@ -1,0 +1,351 @@
+---
+# DIAGNOSTIC ONLY — READ-ONLY — DO NOT RUN WITH --check (shell tasks need rc)
+# Diagnose AllipuramPFCMD-Go-Receiver PAUSED state on scanvix109
+# NO service changes. NO config changes. NO file modifications.
+- name: Diagnose Go Receiver PAUSED state (read-only)
+  hosts: scanvix_rtu
+  gather_facts: false
+
+  vars:
+    nssm_exe:   'D:\AllipuramPFCMD\Receiver\nssm.exe'
+    svc_name:   'AllipuramPFCMD-Go-Receiver'
+    recv_exe:   'D:\AllipuramPFCMD\Receiver\pfcmd-receiver.exe'
+    recv_env:   'D:\AllipuramPFCMD\Receiver\receiver.env'
+    recv_dir:   'D:\AllipuramPFCMD\Receiver'
+
+  tasks:
+
+    # ── CHECK 1: Process tree ────────────────────────────────────────────────
+    - name: DIAG-1 | Process tree (nssm + pfcmd-receiver parent/child)
+      ansible.windows.win_shell: |
+        Write-Output "=== All nssm.exe instances ==="
+        Get-CimInstance Win32_Process -Filter "Name='nssm.exe'" |
+          Select-Object ProcessId, ParentProcessId, CommandLine |
+          Format-List | Out-String
+
+        Write-Output "=== All pfcmd-receiver.exe instances ==="
+        $recv = Get-CimInstance Win32_Process -Filter "Name='pfcmd-receiver.exe'"
+        if ($recv) {
+          $recv | Select-Object ProcessId, ParentProcessId, CommandLine | Format-List | Out-String
+        } else {
+          Write-Output "(pfcmd-receiver.exe is NOT running)"
+        }
+
+        Write-Output "=== Service PID cross-check ==="
+        $svc = Get-CimInstance Win32_Service -Filter "Name='AllipuramPFCMD-Go-Receiver'"
+        if ($svc) {
+          Write-Output "SCM ProcessId : $($svc.ProcessId)"
+          Write-Output "SCM State     : $($svc.State)"
+          Write-Output "SCM StartMode : $($svc.StartMode)"
+          Write-Output "SCM PathName  : $($svc.PathName)"
+        }
+
+        Write-Output "=== Parent of SCM-listed PID ==="
+        $svc = Get-CimInstance Win32_Service -Filter "Name='AllipuramPFCMD-Go-Receiver'"
+        if ($svc -and $svc.ProcessId -gt 0) {
+          $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$($svc.ProcessId)"
+          if ($proc) {
+            Write-Output "PID $($proc.ProcessId) ($($proc.Name)) parent=$($proc.ParentProcessId)"
+            $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.ParentProcessId)"
+            if ($parent) { Write-Output "Parent: PID $($parent.ProcessId) $($parent.Name) cmd=$($parent.CommandLine)" }
+          }
+        }
+      register: chk1
+      changed_when: false
+
+    - name: DIAG-1 | result
+      ansible.builtin.debug:
+        msg: "{{ chk1.stdout_lines }}"
+
+    # ── CHECK 2: Full NSSM configuration ────────────────────────────────────
+    - name: DIAG-2 | NSSM complete configuration for AllipuramPFCMD-Go-Receiver
+      ansible.windows.win_shell: |
+        $n   = 'D:\AllipuramPFCMD\Receiver\nssm.exe'
+        $svc = 'AllipuramPFCMD-Go-Receiver'
+        $keys = @(
+          'Application','AppParameters','AppDirectory',
+          'AppExit 0','AppExit Default',
+          'AppRestartDelay','AppThrottle',
+          'AppStdout','AppStderr',
+          'AppEnvironmentExtra',
+          'Start','ObjectName',
+          'DisplayName','Description'
+        )
+        foreach ($k in $keys) {
+          $val = (& $n get $svc $k 2>&1) -join ' '
+          Write-Output "${k}: ${val}"
+        }
+      register: chk2
+      changed_when: false
+
+    - name: DIAG-2 | result
+      ansible.builtin.debug:
+        msg: "{{ chk2.stdout_lines }}"
+
+    # ── CHECK 3: Receiver stdout/stderr logs ─────────────────────────────────
+    - name: DIAG-3 | NSSM stdout/stderr log paths
+      ansible.windows.win_shell: |
+        $n   = 'D:\AllipuramPFCMD\Receiver\nssm.exe'
+        $svc = 'AllipuramPFCMD-Go-Receiver'
+        $stdout_path = ((& $n get $svc AppStdout 2>&1) -join '').Trim()
+        $stderr_path = ((& $n get $svc AppStderr 2>&1) -join '').Trim()
+        Write-Output "STDOUT_PATH: $stdout_path"
+        Write-Output "STDERR_PATH: $stderr_path"
+
+        foreach ($path in @($stdout_path, $stderr_path)) {
+          if (-not $path -or $path -match '^\s*$') { continue }
+          Write-Output ""
+          Write-Output "=== LOG: $path ==="
+          if (-not (Test-Path $path)) {
+            Write-Output "(file does not exist)"
+            continue
+          }
+          $size = (Get-Item $path).Length
+          Write-Output "Size: $size bytes"
+          Write-Output "--- Last 60 lines ---"
+          Get-Content $path -Tail 60 | Out-String
+        }
+      register: chk3
+      changed_when: false
+
+    - name: DIAG-3 | result
+      ansible.builtin.debug:
+        msg: "{{ chk3.stdout_lines }}"
+
+    # ── CHECK 4: receiver.env (redacted) ─────────────────────────────────────
+    - name: DIAG-4 | receiver.env variable names (credentials redacted)
+      ansible.windows.win_shell: |
+        $envFile = 'D:\AllipuramPFCMD\Receiver\receiver.env'
+        if (-not (Test-Path $envFile)) {
+          Write-Output "CHECK4: receiver.env NOT FOUND at $envFile"
+          exit 0
+        }
+        $size = (Get-Item $envFile).Length
+        Write-Output "CHECK4: receiver.env exists ($size bytes)"
+        Write-Output ""
+        Write-Output "--- Variable names present (values redacted) ---"
+        $secretKeys = @('PASSWORD','PASS','SECRET','TOKEN','KEY','CREDENTIAL','CONN','CONNECTION_STRING','DSN','PWD')
+        Get-Content $envFile | ForEach-Object {
+          $line = $_.Trim()
+          if ($line -eq '' -or $line.StartsWith('#')) { Write-Output $line; return }
+          $eq = $line.IndexOf('=')
+          if ($eq -lt 0) { Write-Output "  (unparseable line)"; return }
+          $varName = $line.Substring(0, $eq).Trim().ToUpper()
+          $val     = $line.Substring($eq + 1).Trim()
+          $isSecret = $false
+          foreach ($s in $secretKeys) { if ($varName -match $s) { $isSecret = $true; break } }
+          if ($isSecret) {
+            $present = if ($val.Length -gt 0) { "SET (redacted)" } else { "EMPTY" }
+            Write-Output "  ${varName} = [${present}]"
+          } else {
+            # Still redact if value looks like a password (contains @ or has long alphanumeric run)
+            if ($val -match '@' -and $val.Length -gt 20) {
+              Write-Output "  ${varName} = [REDACTED — possible connection string]"
+            } else {
+              Write-Output "  ${varName} = $val"
+            }
+          }
+        }
+      register: chk4
+      changed_when: false
+      no_log: false
+
+    - name: DIAG-4 | result
+      ansible.builtin.debug:
+        msg: "{{ chk4.stdout_lines }}"
+
+    # ── CHECK 5: Windows Event Log ───────────────────────────────────────────
+    - name: DIAG-5 | Windows Application + System events (last 2 hours)
+      ansible.windows.win_shell: |
+        $since = (Get-Date).AddHours(-2)
+        $keywords = @(
+          'pfcmd-receiver','AllipuramPFCMD-Go-Receiver','AllipuramPFCMD Go Receiver',
+          'nssm','Application Error','Windows Error Reporting'
+        )
+
+        Write-Output "=== SYSTEM log (Service Control Manager, last 2h) ==="
+        Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=$since} -ErrorAction SilentlyContinue |
+          Where-Object { $_.Message -match 'AllipuramPFCMD|pfcmd|nssm' -or $_.Id -in @(7031,7034,7036,7040,7045) } |
+          Select-Object TimeCreated, Id, ProviderName,
+            @{N='Msg';E={$_.Message -replace '\r?\n',' '}} |
+          Sort-Object TimeCreated |
+          ForEach-Object { Write-Output "$($_.TimeCreated) | ID=$($_.Id) | $($_.ProviderName) | $($_.Msg.Substring(0,[Math]::Min(300,$_.Msg.Length)))" }
+
+        Write-Output ""
+        Write-Output "=== APPLICATION log (last 2h, receiver/nssm related) ==="
+        Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=$since} -ErrorAction SilentlyContinue |
+          Where-Object { $_.Message -match 'AllipuramPFCMD|pfcmd|nssm|receiver' -or
+                         $_.ProviderName -match 'AllipuramPFCMD|pfcmd|nssm' } |
+          Select-Object TimeCreated, Id, ProviderName, Level,
+            @{N='Msg';E={$_.Message -replace '\r?\n',' '}} |
+          Sort-Object TimeCreated |
+          ForEach-Object { Write-Output "$($_.TimeCreated) | ID=$($_.Id) | Lvl=$($_.Level) | $($_.ProviderName) | $($_.Msg.Substring(0,[Math]::Min(300,$_.Msg.Length)))" }
+
+        Write-Output ""
+        Write-Output "=== Last 5 ANY events mentioning receiver (all logs) ==="
+        Get-WinEvent -FilterHashtable @{LogName=@('System','Application'); StartTime=$since} -ErrorAction SilentlyContinue |
+          Where-Object { $_.Message -match 'AllipuramPFCMD-Go-Receiver' } |
+          Sort-Object TimeCreated -Descending |
+          Select-Object -First 10 |
+          ForEach-Object { Write-Output "$($_.TimeCreated) | Log=$($_.LogName) | ID=$($_.Id) | $($_.ProviderName) | $($_.Message.Substring(0,[Math]::Min(400,$_.Message.Length)) -replace '\r?\n',' ')" }
+      register: chk5
+      changed_when: false
+
+    - name: DIAG-5 | result
+      ansible.builtin.debug:
+        msg: "{{ chk5.stdout_lines }}"
+
+    # ── CHECK 6: Receiver executable ─────────────────────────────────────────
+    - name: DIAG-6 | pfcmd-receiver.exe file info
+      ansible.windows.win_shell: |
+        $exe = 'D:\AllipuramPFCMD\Receiver\pfcmd-receiver.exe'
+        if (-not (Test-Path $exe)) { Write-Output "CHECK6 FAIL: $exe NOT FOUND"; exit 0 }
+        $fi   = Get-Item $exe
+        $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+        $ver  = $fi.VersionInfo
+        Write-Output "Exists      : YES"
+        Write-Output "Size        : $($fi.Length) bytes"
+        Write-Output "LastWrite   : $($fi.LastWriteTime)"
+        Write-Output "SHA256      : $hash"
+        Write-Output "FileVersion : $($ver.FileVersion)"
+        Write-Output "ProductVer  : $($ver.ProductVersion)"
+        Write-Output "Description : $($ver.FileDescription)"
+        # Architecture via PE header magic
+        $bytes = [System.IO.File]::ReadAllBytes($exe)
+        $peOff = [BitConverter]::ToInt32($bytes, 0x3C)
+        $machine = [BitConverter]::ToUInt16($bytes, $peOff + 4)
+        $arch = switch ($machine) {
+          0x8664 { 'x64 (AMD64)' }
+          0x014c { 'x86 (i386)' }
+          0xAA64 { 'ARM64' }
+          default { "Unknown (0x{0:X4})" -f $machine }
+        }
+        Write-Output "Architecture: $arch"
+      register: chk6
+      changed_when: false
+
+    - name: DIAG-6 | result
+      ansible.builtin.debug:
+        msg: "{{ chk6.stdout_lines }}"
+
+    # ── CHECK 7: Port ownership ──────────────────────────────────────────────
+    - name: DIAG-7 | Port 8088 and 8089 ownership
+      ansible.windows.win_shell: |
+        foreach ($port in @(8088, 8089)) {
+          $conns = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+          if (-not $conns) {
+            Write-Output "Port $port : NOT LISTENING"
+            continue
+          }
+          foreach ($c in $conns) {
+            $proc = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
+            $name = if ($proc) { $proc.Name } else { "unknown" }
+            $path = if ($proc) { $proc.Path } else { "?" }
+            Write-Output "Port $port : LISTEN $($c.LocalAddress):$($c.LocalPort) PID=$($c.OwningProcess) ($name) path=$path"
+          }
+        }
+      register: chk7
+      changed_when: false
+
+    - name: DIAG-7 | result
+      ansible.builtin.debug:
+        msg: "{{ chk7.stdout_lines }}"
+
+    # ── CHECK 8: Dependencies ────────────────────────────────────────────────
+    - name: DIAG-8 | Dependency checks (SQL Server, local services, env paths)
+      ansible.windows.win_shell: |
+        Write-Output "=== SQL Server services ==="
+        Get-Service -Name 'MSSQL*','SQLAgent*' -ErrorAction SilentlyContinue |
+          Select-Object Name, Status, StartType | Format-Table | Out-String
+
+        Write-Output "=== SQL Server port 1433 ==="
+        $sql = Get-NetTCPConnection -LocalPort 1433 -State Listen -ErrorAction SilentlyContinue
+        if ($sql) {
+          foreach ($c in $sql) {
+            Write-Output "LISTEN 1433: $($c.LocalAddress):$($c.LocalPort) PID=$($c.OwningProcess)"
+          }
+        } else {
+          Write-Output "Port 1433 NOT listening"
+        }
+
+        Write-Output ""
+        Write-Output "=== Receiver directory contents ==="
+        Get-ChildItem 'D:\AllipuramPFCMD\Receiver' -ErrorAction SilentlyContinue |
+          Select-Object Name, Length, LastWriteTime | Format-Table | Out-String
+
+        Write-Output "=== SCM service dependencies for AllipuramPFCMD-Go-Receiver ==="
+        $svc = Get-CimInstance Win32_Service -Filter "Name='AllipuramPFCMD-Go-Receiver'"
+        if ($svc) {
+          Write-Output "StartName : $($svc.StartName)"
+          Write-Output "Dependencies (raw): none defined in CIM — check registry if needed"
+        }
+
+        Write-Output ""
+        Write-Output "=== Other PFCMD/RTU services ==="
+        Get-Service | Where-Object { $_.Name -match 'PFCMD|Storm|Allipuram|Mosquitto|RTU' } |
+          Select-Object Name, Status, StartType | Format-Table | Out-String
+      register: chk8
+      changed_when: false
+
+    - name: DIAG-8 | result
+      ansible.builtin.debug:
+        msg: "{{ chk8.stdout_lines }}"
+
+    # ── CHECK 9: Recent SCM history / restart pattern ─────────────────────────
+    - name: DIAG-9 | SCM restart history and PAUSED state analysis
+      ansible.windows.win_shell: |
+        Write-Output "=== Current service state ==="
+        $svc = Get-CimInstance Win32_Service -Filter "Name='AllipuramPFCMD-Go-Receiver'"
+        Write-Output "State     : $($svc.State)"
+        Write-Output "ProcessId : $($svc.ProcessId)"
+        Write-Output "ExitCode  : $($svc.ExitCode)"
+        Write-Output "CheckPoint: $($svc.CheckPoint)"
+        Write-Output "WaitHint  : $($svc.WaitHint)"
+
+        Write-Output ""
+        Write-Output "=== NSSM AppThrottle check ==="
+        $n = 'D:\AllipuramPFCMD\Receiver\nssm.exe'
+        $throttle     = ((& $n get 'AllipuramPFCMD-Go-Receiver' AppThrottle 2>&1) -join '').Trim()
+        $restartDelay = ((& $n get 'AllipuramPFCMD-Go-Receiver' AppRestartDelay 2>&1) -join '').Trim()
+        $appExit0     = ((& $n get 'AllipuramPFCMD-Go-Receiver' 'AppExit 0' 2>&1) -join '').Trim()
+        $appExitDef   = ((& $n get 'AllipuramPFCMD-Go-Receiver' 'AppExit Default' 2>&1) -join '').Trim()
+        Write-Output "AppThrottle     : $throttle   (ms; if >0 and exceeded, NSSM enters SERVICE_PAUSED)"
+        Write-Output "AppRestartDelay : $restartDelay ms"
+        Write-Output "AppExit 0       : $appExit0"
+        Write-Output "AppExit Default : $appExitDef"
+
+        Write-Output ""
+        Write-Output "=== Last 20 System events: Service Control Manager for this service ==="
+        $since = (Get-Date).AddHours(-4)
+        Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=$since; ProviderName='Service Control Manager'} -ErrorAction SilentlyContinue |
+          Where-Object { $_.Message -match 'AllipuramPFCMD-Go-Receiver|AllipuramPFCMD Go Receiver' } |
+          Sort-Object TimeCreated |
+          Select-Object -Last 20 |
+          ForEach-Object {
+            Write-Output "$($_.TimeCreated) | EventID=$($_.Id) | $($_.Message -replace '\r?\n',' ' | ForEach-Object { $_.Substring(0,[Math]::Min(350,$_.Length)) })"
+          }
+
+        Write-Output ""
+        Write-Output "=== NSSM throttle explanation ==="
+        Write-Output "NSSM enters SERVICE_PAUSED when the managed application crashes faster than"
+        Write-Output "AppThrottle allows it to restart. If AppThrottle is 0 ms, PAUSED is caused by"
+        Write-Output "the application exiting with a code that maps to 'no restart' (AppExit <code> = Exit)."
+        Write-Output "See: https://nssm.cc/usage (Throttling section)"
+      register: chk9
+      changed_when: false
+
+    - name: DIAG-9 | result
+      ansible.builtin.debug:
+        msg: "{{ chk9.stdout_lines }}"
+
+    # ── FINAL SUMMARY placeholder ─────────────────────────────────────────────
+    - name: DIAG | Raw evidence collected — analysis to follow
+      ansible.builtin.debug:
+        msg:
+          - "All 9 read-only checks complete."
+          - "Service state  : {{ (chk1.stdout | regex_search('SCM State\\s+: (\\S+)', '\\1') | first) | default('see chk1') }}"
+          - "pfcmd-receiver : {{ 'RUNNING' if 'pfcmd-receiver.exe' in chk1.stdout and 'NOT running' not in chk1.stdout else 'NOT RUNNING' }}"
+          - "Port 8088      : {{ 'LISTENING' if 'LISTEN' in chk7.stdout else 'NOT LISTENING' }}"
+          - "Port 8089      : {{ 'LISTENING' if '8089' in chk7.stdout and 'NOT LISTENING' not in (chk7.stdout_lines | select('search','8089') | list | join) else 'NOT LISTENING' }}"
+          - "receiver.env   : {{ 'EXISTS' if 'exists' in chk4.stdout else 'NOT FOUND' }}"
+          - "pfcmd-receiver.exe : {{ 'EXISTS' if 'Exists      : YES' in chk4.stdout or 'Exists' in chk6.stdout else 'CHECK chk6' }}"

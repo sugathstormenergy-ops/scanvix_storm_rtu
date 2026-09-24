@@ -1,0 +1,206 @@
+---
+# Storm Energy RTU — Canonical Group Variables
+# =============================================
+# Location: inventory/group_vars/all.yml
+# Ansible loads this from the inventory directory — always found.
+#
+# NO secrets in this file. Supply at runtime via Vault or --extra-vars.
+
+# ── Directory layout ──────────────────────────────────────────────────────────
+scanvix_install_dir:   'E:\StormEnergyRTU'
+scanvix_app_dir:       'E:\StormEnergyRTU\app'
+scanvix_config_dir:    'E:\StormEnergyRTU\config'
+scanvix_logs_dir:      'E:\StormEnergyRTU\logs'
+scanvix_scripts_dir:   'E:\StormEnergyRTU\scripts'
+scanvix_venv_dir:      'E:\StormEnergyRTU.venv'
+scanvix_config_file:   'E:\StormEnergyRTU\app\.env'
+
+# Application source (read-only — never modified by Ansible)
+scanvix_source_dir:    'E:\scanvix_RTU\storm-energy-rtu\backend'
+scanvix_db_script_dir: 'E:\scanvix_RTU\storm-energy-rtu\database'
+
+# ── Network ports ─────────────────────────────────────────────────────────────
+scanvix_api_port:  8090    # Storm API  — must NOT conflict with 8088
+scanvix_mqtt_port: 1883    # Mosquitto  — standard MQTT
+scanvix_tcp_port:  9000    # TCP listener
+
+# ── Database ──────────────────────────────────────────────────────────────────
+scanvix_sql_instance:  '.\SQLEXPRESS'
+scanvix_sql_server:    'DESKTOP-FL70N9E\SQLEXPRESS'
+scanvix_database_name: 'STORM_ENERGY_RTU'
+
+# ── MQTT ─────────────────────────────────────────────────────────────────────
+scanvix_mqtt_host: '127.0.0.1'
+
+# Mosquitto binary and config paths
+# Path confirmed from roles/mqtt/tasks/gate2.yml lines 214-216
+# Windows installer default location (case-insensitive on NTFS)
+scanvix_mosquitto_exe:  'C:\Program Files\mosquitto\mosquitto.exe'
+scanvix_mosquitto_conf: 'C:\Program Files\mosquitto\mosquitto_storm.conf'
+scanvix_mqtt_username: 'allipuram_ingest'  # MQTT identity — not a secret, safe in group_vars
+
+# Storm MQTT password database — dedicated directory outside Program Files.
+# svc_ansible has Modify here; SYSTEM/Administrators have FullControl.
+# The file itself is created by Gate 2 and is NEVER committed to source control.
+scanvix_mqtt_passwd_dir:  'C:\ProgramData\StormEnergyRTU\Mosquitto'
+scanvix_mqtt_passwd_file: 'C:\ProgramData\StormEnergyRTU\Mosquitto\storm_passwd'
+scanvix_mqtt_skip_install: true     # Reuse existing broker — do not install a second Mosquitto
+
+# Controller-side source for the Mosquitto installer.
+# Convention: storm-energy-rtu/installers/mosquitto-install.exe
+# Set to empty string to skip win_copy (assume installer already on target).
+scanvix_mqtt_installer_source: "{{ playbook_dir }}/../../../installers/mosquitto-install.exe"
+
+# ── Windows service account ─────────────────────────────────────────────────
+# StormEnergyRTU-API runs as this account for Windows Integrated Authentication.
+# svc_ansible has HAS_DBACCESS('STORM_ENERGY_RTU')=1 and is sysadmin.
+# Password is sourced from ansible_password (already in hosts.ini).
+scanvix_svc_account: 'DESKTOP-FL70N9E\svc_ansible'
+
+# ── NSSM path — explicit binary; not in system PATH on scanvix109 ───────────────
+# winget-installed NSSM lives alongside AllipuramPFCMD-Go-Receiver (do not move).
+scanvix_nssm_exe: 'D:\AllipuramPFCMD\Receiver\nssm.exe'
+
+# ── MQTT bench test (temporary office LAN bench, Scanvix physical RTU) ──────
+# Adds a SECOND, LAN-reachable Mosquitto listener alongside the existing
+# loopback-only 127.0.0.1:{{ scanvix_mqtt_port }} listener, which remains
+# completely unchanged. Purely additive — set scanvix_mqtt_bench_enabled to
+# false (or omit) to fully disable and have the template emit only the
+# original single listener, exactly as before this change.
+scanvix_mqtt_bench_enabled:    true              # false disables the bench listener entirely
+scanvix_mqtt_bench_port:       1885              # LAN bench listener port (separate from production 1883; 1884 is already occupied by an existing Mosquitto instance -- left untouched)
+scanvix_mqtt_bench_host:       '192.168.0.109'   # bind address — LAN-reachable, NOT 0.0.0.0
+scanvix_fw_mqtt_bench_rule:    'StormEnergyRTU-MQTT-Bench'  # firewall rule name for the bench port
+
+# Separate bench password database -- NEVER the same file as storm_passwd.
+# Bench credentials (bench_<IMEI>) are added here via mosquitto_passwd -b,
+# independent of the production allipuram_ingest credential in storm_passwd.
+# Removing the bench listener/credentials later means: set
+# scanvix_mqtt_bench_enabled: false and delete this file -- storm_passwd is
+# never touched.
+scanvix_mqtt_bench_passwd_file: 'C:\ProgramData\StormEnergyRTU\Mosquitto\bench_passwd'
+
+# scanvix_mqtt_bench_username / scanvix_mqtt_bench_password are supplied at
+# runtime via --extra-vars ONLY (e.g. bench_<IMEI> once the physical RTU
+# arrives) -- never stored here, never committed to source control.
+
+# ── MQTT TLS (future migration target — production TCP 8883) ────────────────
+# Application-side (client) TLS configuration for the Python MQTT consumer.
+# ALL defaults below preserve CURRENT behavior exactly: TLS stays disabled,
+# 1883/1885 are untouched, and no certificate files are assumed to exist.
+# Flipping scanvix_mqtt_tls_enabled to true is a deliberate future action —
+# it is NOT performed by this change, and no deployment has been run.
+#
+# scanvix_mqtt_host currently resolves to 127.0.0.1 (see above). For TLS
+# hostname verification to succeed once TLS is enabled, whatever value
+# scanvix_mqtt_host holds at that time MUST match a SAN entry on the
+# server certificate — see Phase 1 report item G/E for the mqtt.stormenergy.in
+# implication of this.
+scanvix_mqtt_tls_enabled:  true                               # ENABLED — real cert files confirmed present at scanvix_mqtt_tls_certfile/keyfile below
+scanvix_mqtt_tls_port:     8883
+
+# Windows certificate directory — sibling of app/config/logs/scripts under
+# the existing E:\StormEnergyRTU tree (see roles/directories). Not yet
+# created on scanvix109; no certificate files are placed here by this change.
+scanvix_certs_dir:         'E:\StormEnergyRTU\certs'
+scanvix_mqtt_ca_cert:      '{{ scanvix_certs_dir }}\ca.crt'
+scanvix_mqtt_client_cert:  '{{ scanvix_certs_dir }}\client.crt'   # optional — only read if mutual TLS is explicitly required
+scanvix_mqtt_client_key:   '{{ scanvix_certs_dir }}\client.key'   # optional — only read if mutual TLS is explicitly required
+
+# ── MQTT TLS -- Mosquitto (broker/SERVER) side (Phase 3) ────────────────────
+# Distinct on purpose from the CLIENT-side variables directly above
+# (scanvix_mqtt_ca_cert / scanvix_mqtt_client_cert / scanvix_mqtt_client_key
+# describe what the Storm APPLICATION trusts/presents as a TLS client).
+# These describe what Mosquitto itself presents as a TLS SERVER -- its own
+# certificate and private key. Naming kept deliberately unambiguous per
+# Phase 3 instructions: no shared/overloaded variable between the two sides.
+#
+# scanvix_mqtt_tls_enabled / scanvix_mqtt_tls_port (defined above) are
+# shared: one switch is intended to enable both the broker's 8883 listener
+# and the application's TLS target together.
+#
+# NO cafile variable is defined here: this initial architecture is
+# server-only TLS (public ACME certificate + MQTT username/password +
+# future per-device ACL). Mosquitto does NOT verify client certificates,
+# so it needs no CA trust file of its own for that purpose. See Phase 3
+# report item G.
+scanvix_mqtt_tls_hostname:  'mqtt.stormenergy.in'   # certificate SAN / production hostname (Phase 2 decision)
+scanvix_mqtt_tls_version:   'tlsv1.2'               # Mosquitto tls_version directive -- TLS 1.2 minimum, nothing obsolete
+
+# Phase 6 finding (verified against https://www.win-acme.com/reference/plugins/store/pemfiles):
+# win-acme's PemFiles store plugin does NOT natively produce files named
+# fullchain.pem/privkey.pem -- it produces {name}-crt.pem, {name}-key.pem,
+# {name}-chain.pem (cert+chain, i.e. the fullchain equivalent), and
+# {name}-chain-only.pem. The two paths below are therefore the TARGET
+# layout this project has chosen (matching the standard Certbot/Let's
+# Encrypt convention Mosquitto's config expects), not something win-acme
+# produces on its own. A future win-acme post-renewal script (Phase 6
+# design: roles/mqtt/files/win-acme-post-renewal.ps1, NOT wired into any
+# scheduled task yet) is responsible for renaming/copying win-acme's
+# PemFiles output into these exact filenames after every issuance/renewal,
+# before Mosquitto ever reads them. See Phase 6 report items C/G/I.
+# CORRECTION: the certs actually present on scanvix109 (per live inspection,
+# validity 2026-09-17..2026-12-16) use win-acme's own flat naming directly
+# under C:\certs\, NOT the live/<hostname>/fullchain.pem layout above (that
+# layout is win-acme-post-renewal.ps1's TARGET output, and that script is
+# still not wired into any scheduled task -- see Phase 6 note above). Pointing
+# directly at the real files that exist today; if win-acme-post-renewal.ps1 is
+# ever wired in per its original Phase 6 design, these two lines and that
+# script's copy targets must be reconciled together (see renewal note below).
+scanvix_mqtt_tls_certfile:  'C:\certs\{{ scanvix_mqtt_tls_hostname }}-chain.pem'  # cert + intermediate chain (win-acme native output)
+scanvix_mqtt_tls_keyfile:   'C:\certs\{{ scanvix_mqtt_tls_hostname }}-key.pem'    # private key -- ACL already hardened to SYSTEM/Administrators only
+
+# win-acme's OWN state/account/order data (its "ConfigurationPath"), kept
+# separate from the certs\live\<hostname>\ output above -- see Phase 6
+# report item C for how this maps onto win-acme's actual two-directory
+# model (ConfigurationPath vs. the PemFiles store's own output path).
+scanvix_mqtt_acme_state_dir: '{{ scanvix_certs_dir }}\acme-state'
+
+# Firewall rule name reserved for the future 8883 rule (source-of-truth only
+# -- see roles/firewall/tasks/tls.yml, not included by any playbook yet).
+scanvix_fw_mqtt_tls_rule:   'StormEnergyRTU-MQTT-TLS'
+
+# -- MQTT per-device credentials + ACL (Phase 4 DESIGN -- NOT enabled) ------
+# Master switch: renders `acl_file` into the 1883 listener only (see
+# mosquitto.conf.j2). Default false preserves current behaviour exactly --
+# no acl_file directive is emitted, so allow_anonymous false + password_file
+# keep working exactly as they do today for allipuram_ingest.
+scanvix_mqtt_acl_enabled:    false
+scanvix_mqtt_acl_file:       'C:\ProgramData\StormEnergyRTU\Mosquitto\storm_acl'
+
+# Dedicated password file for per-device (rtu_<IMEI>) credentials -- kept
+# SEPARATE from both storm_passwd (allipuram_ingest) and bench_passwd
+# (bench_<IMEI>). See Phase 4 report item K for why a single shared file
+# was rejected.
+scanvix_mqtt_device_passwd_file: 'C:\ProgramData\StormEnergyRTU\Mosquitto\device_passwd'
+
+# Controller-side (NOT scanvix109) directory for per-device generated
+# passwords -- outside this git repository, never committed. Must be set
+# explicitly by whoever runs roles/mqtt/tasks/device_credentials.yml; no
+# default is given here on purpose (see that file's own safety assert).
+# scanvix_mqtt_secrets_dir: '/absolute/path/outside/the/repo'
+
+# Device registry: list of {device_id, username, topic_root, enabled,
+# credential_status}. Empty by default so storm_acl.j2 always renders
+# safely even before inventory/device_registry.yml (Phase 4 example file)
+# is ever loaded by anything. NEVER contains passwords.
+scanvix_mqtt_devices: []
+
+# ── Windows service names ─────────────────────────────────────────────────────
+scanvix_api_service_name:  'StormEnergyRTU-API'
+scanvix_native_mqtt_service_name: 'mosquitto'  # Native Mosquitto Windows service (broker installer)
+scanvix_mqtt_service_name: 'StormEnergyRTU-MQTT'  # Python MQTT consumer NSSM service
+scanvix_storm_mqtt_service_name: 'StormMosquitto'  # NSSM-wrapped Mosquitto broker (replaces native service on port 1883)
+scanvix_tcp_service_name:  'StormEnergyRTU-TCP'
+
+# ── Firewall rule names ───────────────────────────────────────────────────────
+scanvix_fw_api_rule:  'StormEnergyRTU-API-8090'
+scanvix_fw_mqtt_rule: 'StormEnergyRTU-MQTT'
+scanvix_fw_tcp_rule:  'StormEnergyRTU-TCP'
+
+# ── Python / virtual environment ──────────────────────────────────────────────
+# python role resolves the real path at runtime after winget install;
+# these are the derived venv-relative executables — always correct.
+scanvix_pip_exe:      '{{ scanvix_venv_dir }}\Scripts\pip.exe'
+scanvix_venv_python:  '{{ scanvix_venv_dir }}\Scripts\python.exe'
+scanvix_uvicorn_exe:  '{{ scanvix_venv_dir }}\Scripts\uvicorn.exe'

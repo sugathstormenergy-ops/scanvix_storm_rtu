@@ -1,0 +1,101 @@
+---
+# READ-ONLY inspection of the existing Storm Energy RTU app. Changes NOTHING on
+# the server: it only stats/reads files, lists routes, collects tests, and runs
+# SELECT COUNT(*). Drop into ansible/scanvix_rtu/playbooks and run:
+#   export ANSIBLE_ROLES_PATH="$(pwd)/roles"
+#   ansible-playbook -i inventory/hosts.ini playbooks/inspect_receiver.yml
+# Files are fetched to ./_inspection/<host>/ on your WSL for review.
+- name: Connectivity gate
+  hosts: scanvix109
+  gather_facts: false
+  tasks:
+    - ansible.windows.win_ping:
+
+- name: Read-only discovery of receiver/parser/models/routes/tests
+  hosts: scanvix109
+  gather_facts: false
+  vars:
+    code_root: 'E:\StormEnergyRTU\app'                 # dir containing the `app` package
+    app_pkg:   'E:\StormEnergyRTU\app\app'
+    python_exe: 'E:\StormEnergyRTU\.venv\Scripts\python.exe'
+    inspect_files:
+      - 'main.py'
+      - 'config.py'
+      - 'api\health.py'
+      - 'api\telemetry.py'
+      - 'api\devices.py'
+      - 'api\events.py'
+      - 'api\commands.py'
+      - 'api\configuration.py'
+      - 'database\models.py'
+      - 'database\database.py'
+      - 'database\repository.py'
+      - 'tcp\server.py'
+      - 'tcp\connection.py'
+      - 'protocol\tcp_parser.py'
+      - 'services\telemetry_service.py'
+      - 'timezone.py'
+  tasks:
+    - name: List the app package tree (read-only)
+      ansible.windows.win_shell: "Get-ChildItem -Recurse -File '{{ app_pkg }}' | Select-Object -Expand FullName"
+      changed_when: false
+      register: tree
+
+    - name: Show tree
+      ansible.builtin.debug:
+        var: tree.stdout_lines
+
+    - name: Stat each candidate file
+      ansible.windows.win_stat:
+        path: "{{ app_pkg }}\\{{ item }}"
+      loop: "{{ inspect_files }}"
+      register: stats
+
+    - name: Fetch existing files to the control node for review
+      ansible.builtin.fetch:
+        src: "{{ app_pkg }}\\{{ item.item }}"
+        dest: "./_inspection/{{ inventory_hostname }}/{{ item.item | replace('\\','/') }}"
+        flat: true
+      loop: "{{ stats.results }}"
+      loop_control: { label: "{{ item.item }}" }
+      when: item.stat.exists
+
+    - name: Dump the live FastAPI route table (read-only)
+      ansible.windows.win_shell: >
+        & '{{ python_exe }}' -c
+        "import app.main as m;
+        print('\n'.join(sorted(str(getattr(r,'methods',''))+' '+r.path for r in m.app.routes)))"
+      args: { chdir: "{{ code_root }}" }
+      changed_when: false
+      failed_when: false
+      register: routes
+
+    - name: Collect the existing test suite (read-only)
+      ansible.windows.win_shell: "& '{{ python_exe }}' -m pytest --collect-only -q"
+      args: { chdir: "{{ code_root }}" }
+      changed_when: false
+      failed_when: false
+      register: tests
+
+    - name: Row counts (SELECT COUNT only — read-only)
+      ansible.windows.win_shell: >
+        & '{{ python_exe }}' -c
+        "from sqlalchemy import text; from app.database.database import engine;
+        from sqlalchemy.orm import Session;
+        s=Session(engine);
+        print('TCPMessages', s.execute(text('SELECT COUNT(*) FROM dbo.TCPMessages')).scalar());
+        print('RawMessages', s.execute(text('SELECT COUNT(*) FROM dbo.RawMessages')).scalar());
+        print('Devices', s.execute(text('SELECT COUNT(*) FROM dbo.Devices')).scalar())"
+      args: { chdir: "{{ code_root }}" }
+      changed_when: false
+      failed_when: false
+      register: counts
+
+    - name: Inspection summary
+      ansible.builtin.debug:
+        msg:
+          - "ROUTES:"
+          - "{{ routes.stdout_lines | default(['(route dump failed: '+(routes.stderr|default('')|truncate(200))+')']) }}"
+          - "ROW COUNTS: {{ counts.stdout_lines | default(['(count failed)']) }}"
+          - "TESTS (tail): {{ (tests.stdout_lines | default([]))[-15:] }}"
+          - "Files fetched to ./_inspection/{{ inventory_hostname }}/ for review."

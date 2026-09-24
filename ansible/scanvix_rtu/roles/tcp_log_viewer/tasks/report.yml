@@ -1,0 +1,31 @@
+---
+- name: Compute external (candidate Scanvix) packets
+  ansible.builtin.set_fact:
+    _msgs: "{{ (tcp_api.json.messages | default([])) if (tcp_api.json is defined) else [] }}"
+- ansible.builtin.set_fact:
+    _ext: "{{ _msgs | selectattr('sourceIp','defined') | selectattr('sourceIp','match','.') | rejectattr('sourceIp','match','^(127\\.|10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.)') | list }}"
+- ansible.builtin.set_fact:
+    _first: "{{ (_ext[0] if (_ext|length>0) else (_msgs[0] if (_msgs|length>0) else {})) }}"
+
+- name: DEPLOYMENT REPORT
+  ansible.builtin.debug:
+    msg:
+      - "TARGET              : {{ inventory_hostname }} ({{ disc.stdout_lines[0] | default('HOST=?') }})"
+      - "SERVICE             : {{ 'Running' if (svc.stdout | default('') is search('Running')) else 'Failed' }}"
+      - "API PORT 8090       : {{ 'LISTENING' if (ports.stdout is search('P8090=[1-9]')) else 'NOT LISTENING' }}"
+      - "TCP PORT 9000       : {{ 'LISTENING' if (ports.stdout is search('P9000=[1-9]')) else 'NOT LISTENING' }}"
+      - "VIEWER API          : {{ 'PASS' if (tcp_api.status_code|default(0))==200 else 'FAIL' }}  (/api/tcp-logs)"
+      - "VIEWER PAGE         : {{ 'PASS' if (viewer_page.status_code|default(0))==200 else 'FAIL' }}  (/tcp-logs)"
+      - "HEALTH              : {{ 'PASS' if (health.status_code|default(0))==200 else 'FAIL' }}"
+      - "HEALTH/TCP          : {{ 'PASS' if (health_tcp.status_code|default(0))==200 else 'FAIL' }}"
+      - "PUBLIC VIEWER       : {{ 'PASS' if (public_page.status_code|default(0))==200 else 'NOT VERIFIED' }}"
+      - "DATABASE READ MODE  : SELECT-only (TCPMessages/RawMessages/Devices); NO schema change"
+      - "FILES CHANGED       : {{ main_py }} (+ deployed {{ viewer_dest_dir }}\\tcp_logs.py)"
+      - "BACKUP LOCATION     : {{ backup_dir }}"
+      - "SERVICE STATUS      : {{ svc.stdout | default('unknown') | trim }}"
+      - "EXTERNAL TCP PACKET : {{ 'RECEIVED from ' + _first.sourceIp if (_ext|length>0) else 'NOT YET RECEIVED' }}"
+      - "FIRST PKT BYTES     : {{ _first.byteLength | default('(none)') }}"
+      - "FIRST PKT PAYLOAD   : {{ _first.payload | default('(none)') }}"
+      - "FIRST PKT HEX       : {{ _first.payloadHex | default('(none)') }}"
+      - "FIRST PKT PARSE     : {{ _first.parseStatus | default('NOT TESTED') }}"
+      - "V1.4                : NOT CLAIMED (parser unchanged; next phase)"

@@ -1,0 +1,19 @@
+---
+# Verified real layout (double app\app). Confirm via discovery before deploy.
+code_root:        'E:\StormEnergyRTU\app'            # dir that contains the `app` package
+main_py:          'E:\StormEnergyRTU\app\app\main.py'
+viewer_dest_dir:  'E:\StormEnergyRTU\app\app\api'    # app.api package (NOT routers/)
+logs_dir:         'E:\StormEnergyRTU\logs'
+backup_root:      'E:\StormEnergyRTU\backup\scanvix_tcp_viewer'
+nssm_exe:         'D:\AllipuramPFCMD\Receiver\nssm.exe'
+service_name:     'StormEnergyRTU-API'
+python_exe:       'E:\StormEnergyRTU.venv\Scripts\python.exe'   # verify in discovery
+
+# Registration — matches the app's real convention (app.api.* + include_router)
+viewer_import:  'from app.api.tcp_logs import router as tcp_logs_router'
+viewer_include: 'app.include_router(tcp_logs_router)'
+import_anchor:  '^from app\.api'          # insert after the last app.api import
+include_anchor: '^app\.include_router\('  # insert after the last include_router()
+
+api_base:   'http://127.0.0.1:8090'
+public_url: 'http://49.207.11.223:8090/tcp-logs'

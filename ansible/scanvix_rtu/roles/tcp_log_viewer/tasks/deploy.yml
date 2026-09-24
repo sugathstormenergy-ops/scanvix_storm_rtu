@@ -1,0 +1,10 @@
+---
+- name: Deploy read-only viewer into app\api (idempotent, checksum-based)
+  ansible.windows.win_copy:
+    src: "files/tcp_logs.py"
+    dest: "{{ viewer_dest_dir }}\\tcp_logs.py"
+  register: deployed
+
+- name: Deployed file
+  ansible.builtin.debug:
+    msg: "DEPLOYED {{ deployed.dest }} (changed={{ deployed.changed }})"

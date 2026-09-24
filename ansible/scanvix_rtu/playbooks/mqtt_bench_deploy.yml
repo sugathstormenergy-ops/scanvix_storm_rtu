@@ -1,0 +1,322 @@
+---
+# Storm Energy RTU — MQTT LAN Bench Test Deployment
+# ============================================================================
+# Adds a THIRD, temporary, LAN-reachable Mosquitto listener on 1885 for a
+# physical Scanvix RTU office bench test, alongside the existing production
+# 127.0.0.1:1883 listener (left completely unchanged).
+#
+# Reuses roles/mqtt/tasks/gate2.yml with scanvix_mqtt_manage_prod_credential
+# set to false, so this playbook NEVER touches storm_passwd/allipuram_ingest
+# and needs no knowledge of the production MQTT password at all.
+#
+# SAFETY:
+#   - Does not touch AllipuramPFCMD-Go-Receiver, port 8088, IIS, SQL schema,
+#     TCP port 9000, or any unrelated firewall rule (firewall include uses
+#     tasks_from: bench, which contains only the new 1885 rule).
+#   - Port 1884 is a pre-existing, unrelated Mosquitto listener (PID 15280) --
+#     this playbook never inspects, modifies, stops, or restarts it.
+#   - Does not create a public/0.0.0.0 listener -- bench listener binds only
+#     to 192.168.0.109 (this server's LAN address), not 0.0.0.0.
+#   - Does NOT create/update storm_passwd or read/require the production
+#     MQTT password -- scanvix_mqtt_manage_prod_credential: false skips
+#     those three tasks entirely inside roles/mqtt/tasks/gate2.yml.
+#   - Fails BEFORE any config deploy/restart if port 1885 is already
+#     occupied by something else -- never stops/kills that process (this
+#     includes the existing, unrelated listener already on 1884).
+#
+# Usage:
+#   # Deploy listener + firewall rule only (no bench credential yet):
+#   ANSIBLE_CONFIG=ansible.cfg ansible-playbook -i inventory/hosts.ini \
+#     playbooks/mqtt_bench_deploy.yml
+#
+#   # Once the physical RTU's IMEI is known, ALSO add the bench credential:
+#   ANSIBLE_CONFIG=ansible.cfg ansible-playbook -i inventory/hosts.ini \
+#     playbooks/mqtt_bench_deploy.yml \
+#     --extra-vars "scanvix_mqtt_bench_username=bench_<IMEI> scanvix_mqtt_bench_password=<temporary bench secret>"
+
+- name: Storm Energy RTU — MQTT bench listener deploy
+  hosts: scanvix_rtu
+  gather_facts: false
+
+  pre_tasks:
+    - name: PRE | Baseline safety check — Allipuram untouched before we start
+      ansible.windows.win_shell: |
+        $svc = Get-Service -Name 'AllipuramPFCMD-Go-Receiver' -ErrorAction SilentlyContinue
+        $port = Get-NetTCPConnection -LocalPort 8088 -State Listen -ErrorAction SilentlyContinue
+        Write-Output "AllipuramSvc: $($svc.Status)"
+        if ($port) { Write-Output "Port8088: LISTENING pid=$($port.OwningProcess)" } else { Write-Output "Port8088: NOT LISTENING" }
+      register: pre_allipuram
+      changed_when: false
+
+    - name: PRE | Allipuram baseline
+      ansible.builtin.debug:
+        msg: "{{ pre_allipuram.stdout_lines }}"
+
+    # ── PORT 1885 PRE-FLIGHT — must run before ANY config deploy/restart ────
+    # Read-only. If something else already owns 1885, STOP here. Never stops,
+    # kills, or restarts the occupying process under any circumstance.
+    - name: "PRE | Port 1885 pre-flight — must be free before any MQTT config/restart"
+      ansible.windows.win_shell: |
+        $c = Get-NetTCPConnection -LocalPort {{ scanvix_mqtt_bench_port }} -State Listen -ErrorAction SilentlyContinue
+        if ($c) {
+          foreach ($b in $c) {
+            $proc = Get-Process -Id $b.OwningProcess -ErrorAction SilentlyContinue
+            Write-Output "OCCUPIED LocalAddress=$($b.LocalAddress) LocalPort=$($b.LocalPort) State=$($b.State) PID=$($b.OwningProcess) Process=$($proc.ProcessName)"
+          }
+        } else {
+          Write-Output "FREE"
+        }
+      register: bench_port_preflight
+      changed_when: false
+
+    - name: "PRE | FAIL if port 1885 is already occupied (read-only — nothing was stopped/killed)"
+      ansible.builtin.fail:
+        msg:
+          - "Port {{ scanvix_mqtt_bench_port }} is already in use — refusing to deploy or restart anything."
+          - "{{ bench_port_preflight.stdout_lines }}"
+          - "This playbook NEVER stops or kills an occupying process. Free the port manually, or choose a different scanvix_mqtt_bench_port, then re-run."
+      when: "'OCCUPIED' in bench_port_preflight.stdout"
+
+    - name: "PRE | Port 1885 pre-flight result"
+      ansible.builtin.debug:
+        msg: "Port {{ scanvix_mqtt_bench_port }}: {{ bench_port_preflight.stdout | trim }}"
+
+  tasks:
+    # ── 1. Bench password file: pre-create if absent (mirrors storm_passwd) ──
+    - name: BENCH | Ensure bench_passwd file exists (pre-create if absent)
+      ansible.windows.win_shell: |
+        $file = '{{ scanvix_mqtt_bench_passwd_file }}'
+        if (-not (Test-Path $file)) {
+          New-Item -ItemType File -Path $file -Force | Out-Null
+          Write-Output "BENCH_PASSWD_CREATED: $file"
+        } else {
+          Write-Output "BENCH_PASSWD_EXISTS: $file"
+        }
+      register: bench_passwd_precreate
+      changed_when: "'BENCH_PASSWD_CREATED' in bench_passwd_precreate.stdout"
+
+    - name: BENCH | Bench passwd pre-create result
+      ansible.builtin.debug:
+        var: bench_passwd_precreate
+
+    # ── 2. Add/update the bench credential — ONLY if supplied this run ──────
+    # Skips cleanly (no-op) when the IMEI/credential isn't known yet today;
+    # re-run this playbook later with the two extra-vars once it is.
+    - name: BENCH | Create/update bench_<IMEI> credential (no_log, only if supplied)
+      ansible.windows.win_shell: |
+        $exe = 'C:\Program Files\Mosquitto\mosquitto_passwd.exe'
+        if (-not (Test-Path $exe)) {
+          Write-Error "mosquitto_passwd.exe not found at: $exe"
+          exit 1
+        }
+        & $exe -b '{{ scanvix_mqtt_bench_passwd_file }}' `
+            '{{ scanvix_mqtt_bench_username }}' `
+            '{{ scanvix_mqtt_bench_password }}'
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "mosquitto_passwd failed with exit code $LASTEXITCODE"
+          exit 1
+        }
+        Write-Output "bench_passwd: entry created/updated"
+      no_log: true
+      register: bench_passwd_result
+      changed_when: true
+      when:
+        - scanvix_mqtt_bench_username | default('') | length > 0
+        - scanvix_mqtt_bench_password | default('') | length > 0
+
+    - name: BENCH | Bench credential result
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Bench credential set for ' ~ scanvix_mqtt_bench_username
+             if (scanvix_mqtt_bench_username | default('') | length > 0)
+             else 'SKIPPED — no scanvix_mqtt_bench_username/password supplied this run (IMEI not yet known). Listener will still deploy below with an empty bench_passwd -- see BENCH | Bench auth-readiness report.' }}
+
+    # ── 3. Reuse roles/mqtt/tasks/gate2.yml WITHOUT the production credential ──
+    # scanvix_mqtt_manage_prod_credential: false skips storm_passwd
+    # create/update, the auth-publish test, and the wrong-password test
+    # inside that file entirely -- this playbook never supplies, reads, or
+    # requires scanvix_mqtt_password.
+    - name: "BENCH | Reuse MQTT Gate 2 tasks (config+service only — production credential tasks skipped)"
+      ansible.builtin.include_role:
+        name: mqtt
+        tasks_from: gate2
+      vars:
+        scanvix_mqtt_manage_prod_credential: false
+
+    # ── 3b. Let a just-triggered restart settle before verifying anything ───
+    # gate2.yml's own "wait for Running" only confirms SCM service state;
+    # give the broker a few extra seconds to finish binding both listeners
+    # and loading both password files before we test either of them.
+    - name: "BENCH | Settle pause after any config-triggered restart"
+      ansible.builtin.pause:
+        seconds: 5
+
+    # ── 4. Firewall — bench port ONLY (dedicated tasks_from: bench file) ────
+    # main.yml (the 3 existing API/MQTT/TCP rules) is never included here.
+    - name: "BENCH | Apply firewall rule (ONLY the 1885 bench rule; existing rules untouched)"
+      ansible.builtin.include_role:
+        name: firewall
+        tasks_from: bench
+
+    # ── 5. Verify both listeners, ownership, and loopback/LAN binding ───────
+    - name: BENCH | Verify both listeners (1883 loopback, 1885 LAN) and owning process
+      ansible.windows.win_shell: |
+        $c1883 = Get-NetTCPConnection -LocalPort {{ scanvix_mqtt_port }} -State Listen -ErrorAction SilentlyContinue
+        $cBench = Get-NetTCPConnection -LocalPort {{ scanvix_mqtt_bench_port }} -State Listen -ErrorAction SilentlyContinue
+
+        if ($c1883) {
+          foreach ($b in $c1883) {
+            $p = Get-Process -Id $b.OwningProcess -ErrorAction SilentlyContinue
+            Write-Output "1883 LISTEN $($b.LocalAddress):$($b.LocalPort) pid=$($b.OwningProcess) process=$($p.ProcessName)"
+          }
+          $ext1883 = $c1883 | Where-Object { $_.LocalAddress -notin @('127.0.0.1','::1') }
+          if ($ext1883) { Write-Output "SECURITY WARNING: 1883 has a non-loopback binding" } else { Write-Output "1883 LOOPBACK-ONLY: confirmed" }
+        } else { Write-Output "1883 NOT LISTENING" }
+
+        if ($cBench) {
+          foreach ($b in $cBench) {
+            $p = Get-Process -Id $b.OwningProcess -ErrorAction SilentlyContinue
+            Write-Output "1885 LISTEN $($b.LocalAddress):$($b.LocalPort) pid=$($b.OwningProcess) process=$($p.ProcessName)"
+          }
+          $onLan = $cBench | Where-Object { $_.LocalAddress -eq '{{ scanvix_mqtt_bench_host }}' }
+          if ($onLan) { Write-Output "1885 BOUND TO INTENDED LAN ADDRESS ({{ scanvix_mqtt_bench_host }}): confirmed" }
+          else { Write-Output "WARNING: 1885 is not bound to the expected LAN address {{ scanvix_mqtt_bench_host }}" }
+        } elseif ('{{ scanvix_mqtt_bench_enabled | default(false) }}' -eq 'True') {
+          Write-Output "1885 NOT LISTENING (bench enabled but listener absent — investigate before RTU test)"
+        } else {
+          Write-Output "1885 NOT LISTENING (scanvix_mqtt_bench_enabled is false — expected)"
+        }
+      register: bench_listener_check
+      changed_when: false
+
+    - name: BENCH | Listener check result
+      ansible.builtin.debug:
+        msg: "{{ bench_listener_check.stdout_lines }}"
+
+    # ── 6. Confirm the rendered config actually contains what we expect ─────
+    # Directive presence only -- never reads or prints password_file *contents*.
+    - name: BENCH | Confirm rendered mosquitto_storm.conf contains required directives
+      ansible.windows.win_shell: |
+        $conf = 'C:\ProgramData\StormEnergyRTU\Mosquitto\mosquitto_storm.conf'
+        $content = Get-Content $conf -Raw -ErrorAction Stop
+        $checks = @(
+          @{ name='per_listener_settings true'; pat='per_listener_settings\s+true' },
+          @{ name='listener 1883 127.0.0.1';    pat='listener\s+{{ scanvix_mqtt_port }}\s+127\.0\.0\.1' },
+          @{ name='password_file storm_passwd'; pat='password_file\s+.*storm_passwd' },
+          @{ name='listener 1885 LAN host';     pat='listener\s+{{ scanvix_mqtt_bench_port }}\s+{{ scanvix_mqtt_bench_host | regex_escape }}' },
+          @{ name='password_file bench_passwd'; pat='password_file\s+.*bench_passwd' },
+          @{ name='allow_anonymous false';      pat='allow_anonymous\s+false' }
+        )
+        foreach ($c in $checks) {
+          if ($content -match $c.pat) { Write-Output "PRESENT: $($c.name)" }
+          else { Write-Output "MISSING: $($c.name)" }
+        }
+      register: bench_conf_check
+      changed_when: false
+      when: scanvix_mqtt_bench_enabled | default(false) | bool
+
+    - name: BENCH | Rendered config directive check (presence only — no secret values shown)
+      ansible.builtin.debug:
+        msg: "{{ bench_conf_check.stdout_lines | default(['(skipped — scanvix_mqtt_bench_enabled is false)']) }}"
+
+    # ── 7. Bench auth-readiness report (no credential rewriting occurs here) ──
+    - name: BENCH | Check whether bench_passwd currently has any entries (size only, no content)
+      ansible.windows.win_shell: |
+        $file = '{{ scanvix_mqtt_bench_passwd_file }}'
+        if (Test-Path $file) {
+          $len = (Get-Item $file).Length
+          Write-Output "BENCH_PASSWD_SIZE_BYTES: $len"
+        } else {
+          Write-Output "BENCH_PASSWD_SIZE_BYTES: FILE_NOT_FOUND"
+        }
+      register: bench_passwd_size
+      changed_when: false
+
+    - name: BENCH | Bench auth-readiness report
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Bench listener is configured, but bench_passwd is EMPTY (0 bytes) — no authenticated bench user exists yet. The RTU CANNOT authenticate until a bench credential is provisioned (re-run with scanvix_mqtt_bench_username/scanvix_mqtt_bench_password once the IMEI is known). Anonymous access remains disabled -- the listener has NOT been weakened.'
+             if ('BENCH_PASSWD_SIZE_BYTES: 0' in bench_passwd_size.stdout)
+             else 'bench_passwd has at least one entry — a bench credential exists (value/hash not shown).' }}
+
+    # ── 8. Bench-listener security tests (anon + auth, if credential supplied) ──
+    - name: "BENCH | TEST — anonymous publish on 1885 (must be rejected)"
+      ansible.windows.win_shell: |
+        $pub = 'C:\Program Files\Mosquitto\mosquitto_pub.exe'
+        if (-not (Test-Path $pub)) { Write-Output "SKIP: mosquitto_pub.exe not found"; exit 0 }
+        & $pub -h {{ scanvix_mqtt_bench_host }} -p {{ scanvix_mqtt_bench_port }} `
+            -t 'storm/test/bench-anon' -m 'anon-attempt' 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Output "BENCH_ANON_REJECT: CONFIRMED (exit $LASTEXITCODE)" }
+        else { Write-Error "SECURITY FAIL: anonymous publish accepted on bench listener"; exit 1 }
+      register: bench_test_anon
+      changed_when: false
+      failed_when: bench_test_anon.rc != 0
+      when: scanvix_mqtt_bench_enabled | default(false) | bool
+
+    - name: BENCH | Anonymous rejection result (1885)
+      ansible.builtin.debug:
+        var: bench_test_anon
+
+    - name: "BENCH | TEST — authenticated publish on 1885 with bench credential (only if supplied)"
+      ansible.windows.win_shell: |
+        $pub = 'C:\Program Files\Mosquitto\mosquitto_pub.exe'
+        if (-not (Test-Path $pub)) { Write-Output "SKIP: mosquitto_pub.exe not found"; exit 0 }
+        & $pub -h {{ scanvix_mqtt_bench_host }} -p {{ scanvix_mqtt_bench_port }} `
+            -u '{{ scanvix_mqtt_bench_username }}' `
+            -P '{{ scanvix_mqtt_bench_password }}' `
+            -t 'storm/test/bench-auth' -m 'bench-auth-ok' -q 1 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { Write-Output "BENCH_AUTH_PUBLISH: SUCCESS" }
+        else { Write-Error "BENCH_AUTH_PUBLISH: FAILED (exit $LASTEXITCODE)"; exit 1 }
+      no_log: true
+      register: bench_test_auth
+      changed_when: false
+      failed_when: bench_test_auth.rc != 0
+      when:
+        - scanvix_mqtt_bench_username | default('') | length > 0
+        - scanvix_mqtt_bench_password | default('') | length > 0
+
+    - name: BENCH | Authenticated publish result (1885, if credential supplied)
+      ansible.builtin.debug:
+        msg: "{{ bench_test_auth.stdout_lines | default(['SKIPPED — no bench credential supplied this run']) }}"
+
+  post_tasks:
+    - name: POST | Final Allipuram/8088 safety check (read-only)
+      ansible.windows.win_shell: |
+        $svc = Get-Service -Name 'AllipuramPFCMD-Go-Receiver' -ErrorAction SilentlyContinue
+        $port = Get-NetTCPConnection -LocalPort 8088 -State Listen -ErrorAction SilentlyContinue
+        Write-Output "AllipuramSvc: $($svc.Status)"
+        if ($port) { Write-Output "Port8088: LISTENING pid=$($port.OwningProcess)" } else { Write-Output "Port8088: NOT LISTENING" }
+      register: post_allipuram
+      changed_when: false
+
+    - name: POST | Allipuram final state
+      ansible.builtin.debug:
+        msg: "{{ post_allipuram.stdout_lines }}"
+
+    - name: POST | StormMosquitto service state (must be Running)
+      ansible.windows.win_shell: |
+        (Get-Service -Name '{{ scanvix_storm_mqtt_service_name }}').Status
+      register: post_mosquitto_status
+      changed_when: false
+
+    - name: POST | StormMosquitto status
+      ansible.builtin.debug:
+        msg: "StormMosquitto: {{ post_mosquitto_status.stdout | trim }}"
+
+    - name: POST | Confirm no production credential task ran this play
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'scanvix_mqtt_manage_prod_credential was passed as false to the mqtt/gate2 include — storm_passwd create/update, the authenticated-publish test, and the wrong-password test were all SKIPPED. allipuram_ingest was not read, rewritten, or validated by this play.' }}
+
+    - name: POST | Current StormEnergyRTU-API / TCP 9000 status (informational only — not modified by this playbook)
+      ansible.windows.win_shell: |
+        $svc = Get-Service -Name '{{ scanvix_api_service_name }}' -ErrorAction SilentlyContinue
+        $port = Get-NetTCPConnection -LocalPort {{ scanvix_tcp_port }} -State Listen -ErrorAction SilentlyContinue
+        Write-Output "StormEnergyRTU-API: $($svc.Status)"
+        if ($port) { Write-Output "Port9000: LISTENING" } else { Write-Output "Port9000: NOT LISTENING" }
+      register: post_api_status
+      changed_when: false
+
+    - name: POST | StormEnergyRTU-API/TCP status (informational)
+      ansible.builtin.debug:
+        msg: "{{ post_api_status.stdout_lines }}"

@@ -1,0 +1,23 @@
+# NOTE: When running as a unified uvicorn process (default), the MQTT consumer
+# is managed within the storm-rtu-api service above.
+# This service definition is provided for optional standalone MQTT consumer deployment.
+[Unit]
+Description=Storm Energy RTU Platform — Standalone MQTT Consumer
+After=network.target mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=exec
+User={{ app_user }}
+Group={{ app_group }}
+WorkingDirectory={{ app_base_dir }}/backend
+EnvironmentFile={{ app_base_dir }}/backend/.env
+ExecStart={{ app_base_dir }}/venv/bin/python -m app.mqtt.consumer
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=storm-rtu-mqtt
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,43 @@
+---
+# Storm Energy RTU — Configure Playbook
+# =======================================
+# Redeploys ONLY the .env configuration file to the target server.
+# Use this to update settings without re-running the full deployment.
+# Restarts Storm services after config update.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini playbooks/configure.yml \
+#     -e @secrets.yml --ask-vault-pass
+
+- name: Storm Energy RTU — Reconfigure
+  hosts: scanvix_rtu
+  gather_facts: false
+
+  tasks:
+    - name: CONFIGURE | Deploy .env from template
+      ansible.windows.win_template:
+        src: '../roles/storm_rtu/templates/env.j2'
+        dest: '{{ scanvix_config_file }}'
+      notify:
+        - Restart Storm API
+        - Restart Storm MQTT
+        - Restart Storm TCP
+
+  handlers:
+    - name: Restart Storm API
+      ansible.windows.win_service:
+        name: '{{ scanvix_api_service_name }}'
+        state: restarted
+        force_dependent_services: false
+
+    - name: Restart Storm MQTT
+      ansible.windows.win_service:
+        name: '{{ scanvix_mqtt_service_name }}'
+        state: restarted
+        force_dependent_services: false
+
+    - name: Restart Storm TCP
+      ansible.windows.win_service:
+        name: '{{ scanvix_tcp_service_name }}'
+        state: restarted
+        force_dependent_services: false

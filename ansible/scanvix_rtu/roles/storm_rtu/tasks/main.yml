@@ -1,0 +1,63 @@
+---
+# Storm Energy RTU — Application Role
+# Source:      controller: {{ playbook_dir }}/../../../backend/
+# Destination: scanvix109: {{ scanvix_app_dir }}
+# Does NOT modify the source project directory.
+
+- name: STORM_RTU | Create install directory
+  ansible.windows.win_file:
+    path: '{{ scanvix_install_dir }}'
+    state: directory
+
+- name: STORM_RTU | Create app directory
+  ansible.windows.win_file:
+    path: '{{ scanvix_app_dir }}'
+    state: directory
+
+- name: STORM_RTU | Create logs directory
+  ansible.windows.win_file:
+    path: '{{ scanvix_logs_dir }}'
+    state: directory
+
+- name: STORM_RTU | Verify source directory exists on controller
+  ansible.builtin.stat:
+    path: '{{ playbook_dir }}/../../../backend'
+  register: source_stat
+  delegate_to: localhost
+  failed_when: not source_stat.stat.exists
+
+- name: STORM_RTU | Copy backend to app dir (controller → scanvix109)
+  ansible.windows.win_copy:
+    src: '{{ playbook_dir }}/../../../backend/'
+    dest: '{{ scanvix_app_dir }}\'
+  register: copy_result
+
+- name: STORM_RTU | Remove __pycache__ and .pyc from app dir
+  ansible.windows.win_shell: |
+    Get-ChildItem -Path '{{ scanvix_app_dir }}' -Recurse -Directory -Filter '__pycache__' -ErrorAction SilentlyContinue |
+      Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Path '{{ scanvix_app_dir }}' -Recurse -Include '*.pyc' -ErrorAction SilentlyContinue |
+      Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Path '{{ scanvix_app_dir }}' -Recurse -Directory -Filter '.pytest_cache' -ErrorAction SilentlyContinue |
+      Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Output "Cleanup complete"
+  changed_when: false
+
+- name: STORM_RTU | Deploy .env configuration
+  ansible.windows.win_template:
+    src: env.j2
+    dest: '{{ scanvix_config_file }}'
+  notify:
+    - Restart Storm services
+
+- name: STORM_RTU | Verify app/main.py deployed
+  ansible.windows.win_stat:
+    path: '{{ scanvix_app_dir }}\app\main.py'
+  register: main_stat
+  failed_when: not main_stat.stat.exists
+
+- name: STORM_RTU | Verify .env deployed
+  ansible.windows.win_stat:
+    path: '{{ scanvix_config_file }}'
+  register: env_stat
+  failed_when: not env_stat.stat.exists

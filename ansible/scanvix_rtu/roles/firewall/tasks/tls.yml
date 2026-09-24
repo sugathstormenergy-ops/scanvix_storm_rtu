@@ -1,0 +1,50 @@
+---
+# Storm Energy RTU — Firewall Role — MQTT TLS (8883) Rule Only
+#
+# SOURCE-OF-TRUTH ONLY. This file is NOT included by any playbook or role
+# yet -- it cannot run, even accidentally, until a future phase explicitly
+# adds an `include_role: name: firewall, tasks_from: tls` (or equivalent)
+# task to a playbook. Written now so the exact future rule is reviewable
+# ahead of time, per Phase 3 instructions ("prepare the source-of-truth for
+# a future TCP 8883 inbound rule ... do not actually create it yet").
+#
+# Mirrors the proven roles/firewall/tasks/bench.yml pattern exactly:
+# deliberately separate from tasks/main.yml so this rule is never bundled
+# with the 3 unrelated production rule tasks (API/MQTT/TCP), and gated on
+# a dedicated enable flag so it stays fully inert until deliberately wired
+# up and that flag is flipped.
+#
+# SAFETY: TCP only, single port only, gated on scanvix_mqtt_tls_enabled,
+# never touches any existing rule, never touches port 8088/9000, never
+# runs unless explicitly included by a future playbook.
+
+- name: FIREWALL-TLS | Create MQTT-TLS rule {{ scanvix_fw_mqtt_tls_rule | default('') }}
+  community.windows.win_firewall_rule:
+    name:      '{{ scanvix_fw_mqtt_tls_rule }}'
+    localport: '{{ scanvix_mqtt_tls_port }}'
+    action:    allow
+    direction: in
+    protocol:  tcp
+    profiles:  public
+    state:     present
+    enabled:   true
+    description: 'Storm Energy RTU -- MQTT over TLS (port {{ scanvix_mqtt_tls_port }}) -- {{ scanvix_mqtt_tls_hostname | default("") }}'
+  when: scanvix_mqtt_tls_enabled | default(false) | bool
+
+- name: FIREWALL-TLS | Confirm MQTT-TLS rule (if enabled)
+  ansible.windows.win_shell: |
+    $rule = Get-NetFirewallRule -DisplayName '{{ scanvix_fw_mqtt_tls_rule | default("") }}' -ErrorAction SilentlyContinue
+    if ($rule) { "OK  {{ scanvix_fw_mqtt_tls_rule | default('') }}  Enabled=$($rule.Enabled)  Profile=$($rule.Profile)" }
+    else { "MISSING  {{ scanvix_fw_mqtt_tls_rule | default('') }}" }
+  register: fw_tls_confirm
+  changed_when: false
+  when: scanvix_mqtt_tls_enabled | default(false) | bool
+
+- name: FIREWALL-TLS | MQTT-TLS rule confirmation (if enabled)
+  ansible.builtin.debug:
+    msg: >-
+      {{ fw_tls_confirm.stdout
+         if (fw_tls_confirm is defined and fw_tls_confirm.stdout is defined)
+         else ('(check mode -- scanvix_mqtt_tls_enabled is true; rule would be created/verified on a real run, but the live Get-NetFirewallRule confirmation does not execute under --check)'
+               if (scanvix_mqtt_tls_enabled | default(false) | bool)
+               else '(MQTT-TLS firewall rule disabled -- scanvix_mqtt_tls_enabled is false, or this file is not yet included by any playbook)') }}

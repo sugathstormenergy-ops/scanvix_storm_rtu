@@ -1,0 +1,45 @@
+---
+# READ-ONLY verification of the real application before any change.
+- name: Stat key paths
+  ansible.windows.win_stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ code_root }}"
+    - "{{ main_py }}"
+    - "{{ viewer_dest_dir }}"
+    - "{{ nssm_exe }}"
+    - "{{ python_exe }}"
+    - "{{ viewer_dest_dir }}\\tcp_logs.py"
+  register: st
+
+- name: Assert application + api package + nssm + venv exist
+  ansible.builtin.assert:
+    that:
+      - st.results[0].stat.exists   # code_root
+      - st.results[1].stat.exists   # main.py
+      - st.results[2].stat.exists   # app\api
+      - st.results[3].stat.exists   # nssm
+      - st.results[4].stat.exists   # venv python
+    fail_msg: "A required path is missing; fix defaults/main.yml. Nothing changed."
+
+- name: Confirm existing api modules + db models/repository are present (read-only)
+  ansible.windows.win_shell: |
+    Write-Output "HOST=$(hostname)"
+    Write-Output "OS=$((Get-CimInstance Win32_OperatingSystem).Caption)"
+    Write-Output "SVC=$((Get-Service '{{ service_name }}' -ErrorAction SilentlyContinue).Status)"
+    Write-Output "API_FILES=$((Get-ChildItem '{{ viewer_dest_dir }}' -Filter *.py | Select-Object -Expand Name) -join ',')"
+    Write-Output "DB_FILES=$((Get-ChildItem '{{ code_root }}\app\database' -Filter *.py | Select-Object -Expand Name) -join ',')"
+    Write-Output "TCPLOGS_EXISTS={{ st.results[5].stat.exists }}"
+  changed_when: false
+  register: disc
+
+- name: Read main.py to confirm the router convention
+  ansible.builtin.slurp:
+    src: "{{ main_py }}"
+  register: main_raw
+
+- name: Show discovery + existing include_router lines
+  ansible.builtin.debug:
+    msg: >-
+      {{ disc.stdout_lines }} |
+      include_router_lines={{ (main_raw.content | b64decode).split('\n') | select('search','include_router') | list }}

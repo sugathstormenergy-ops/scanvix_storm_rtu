@@ -1,0 +1,22 @@
+---
+- name: Ensure the viewer import exists (after the last app.api import)
+  community.windows.win_lineinfile:
+    path: "{{ main_py }}"
+    line: "{{ viewer_import }}"
+    insertafter: "{{ import_anchor }}"
+    state: present
+    backup: true
+  register: import_edit
+
+- name: Ensure the include_router call exists (after the last include_router)
+  community.windows.win_lineinfile:
+    path: "{{ main_py }}"
+    line: "{{ viewer_include }}"
+    insertafter: "{{ include_anchor }}"
+    state: present
+    backup: true
+  register: include_edit
+
+- name: Registration summary
+  ansible.builtin.debug:
+    msg: "import_changed={{ import_edit.changed }} include_changed={{ include_edit.changed }}"

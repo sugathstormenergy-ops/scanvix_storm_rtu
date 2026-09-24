@@ -1,0 +1,167 @@
+---
+# Storm Energy RTU — Rollback Playbook
+# ======================================
+# Removes Storm Energy RTU components from 192.168.0.109.
+#
+# SCOPE — ONLY removes:
+#   - StormEnergyRTU-API, StormEnergyRTU-MQTT, StormEnergyRTU-TCP services
+#   - E:\StormEnergyRTU\ directory
+#   - E:\StormEnergyRTU.venv\ directory
+#   - Storm firewall rules: StormEnergyRTU-API-8090, StormEnergyRTU-MQTT, StormEnergyRTU-TCP
+#
+# NEVER touches:
+#   - Allipuram / PFCMD services
+#   - Port 8088 or any existing firewall rules
+#   - WATER_METERS, NCC_WATER_METERS, or any existing databases
+#   - IIS, scheduled tasks, or any other infrastructure
+#   - E:\scanvix_RTU\storm-energy-rtu\ (the source project)
+#
+# The STORM_ENERGY_RTU database is NOT dropped automatically.
+# Database rollback requires explicit confirmation — see db_rollback.yml (not provided).
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini playbooks/rollback.yml
+#
+# To include database drop (DESTRUCTIVE — use with extreme caution):
+#   ansible-playbook -i inventory/hosts.ini playbooks/rollback.yml \
+#     -e "rollback_drop_database=true"
+
+- name: Storm Energy RTU — Rollback
+  hosts: scanvix_rtu
+  gather_facts: false
+
+  vars:
+    rollback_drop_database: false   # Must be explicitly set to true to drop DB
+
+  pre_tasks:
+    - name: ROLLBACK | Safety check — confirm scope
+      ansible.builtin.pause:
+        prompt: |
+
+          ============================================================
+          STORM ENERGY RTU ROLLBACK
+          ============================================================
+          This will STOP and REMOVE:
+            - StormEnergyRTU-API service
+            - StormEnergyRTU-MQTT service
+            - StormEnergyRTU-TCP service
+            - E:\StormEnergyRTU\
+            - E:\StormEnergyRTU.venv\
+            - Storm firewall rules
+
+          This will NOT touch:
+            - Allipuram / PFCMD
+            - Port 8088
+            - Existing databases
+            - Existing Windows services
+
+          Database drop: {{ rollback_drop_database }}
+
+          Press ENTER to continue or Ctrl+C to abort.
+
+  tasks:
+
+    # ── Stop Storm services (named exactly — never wildcard) ──────────────────
+    - name: ROLLBACK | Stop {{ scanvix_api_service_name }}
+      ansible.windows.win_service:
+        name: '{{ scanvix_api_service_name }}'
+        state: stopped
+        force_dependent_services: false
+      ignore_errors: true
+
+    - name: ROLLBACK | Stop {{ scanvix_mqtt_service_name }}
+      ansible.windows.win_service:
+        name: '{{ scanvix_mqtt_service_name }}'
+        state: stopped
+        force_dependent_services: false
+      ignore_errors: true
+
+    - name: ROLLBACK | Stop {{ scanvix_tcp_service_name }}
+      ansible.windows.win_service:
+        name: '{{ scanvix_tcp_service_name }}'
+        state: stopped
+        force_dependent_services: false
+      ignore_errors: true
+
+    # ── Remove Storm services ─────────────────────────────────────────────────
+    - name: ROLLBACK | Remove {{ scanvix_api_service_name }}
+      ansible.windows.win_shell: |
+        $svc = Get-Service -Name '{{ scanvix_api_service_name }}' -ErrorAction SilentlyContinue
+        if ($svc) { sc.exe delete '{{ scanvix_api_service_name }}' } else { "Service not found — skipping" }
+      changed_when: true
+
+    - name: ROLLBACK | Remove {{ scanvix_mqtt_service_name }}
+      ansible.windows.win_shell: |
+        $svc = Get-Service -Name '{{ scanvix_mqtt_service_name }}' -ErrorAction SilentlyContinue
+        if ($svc) { sc.exe delete '{{ scanvix_mqtt_service_name }}' } else { "Service not found — skipping" }
+      changed_when: true
+
+    - name: ROLLBACK | Remove {{ scanvix_tcp_service_name }}
+      ansible.windows.win_shell: |
+        $svc = Get-Service -Name '{{ scanvix_tcp_service_name }}' -ErrorAction SilentlyContinue
+        if ($svc) { sc.exe delete '{{ scanvix_tcp_service_name }}' } else { "Service not found — skipping" }
+      changed_when: true
+
+    # ── Remove Storm firewall rules ───────────────────────────────────────────
+    - name: ROLLBACK | Remove firewall rule {{ scanvix_fw_api_rule }}
+      community.windows.win_firewall_rule:
+        name: '{{ scanvix_fw_api_rule }}'
+        state: absent
+      ignore_errors: true
+
+    - name: ROLLBACK | Remove firewall rule {{ scanvix_fw_mqtt_rule }}
+      community.windows.win_firewall_rule:
+        name: '{{ scanvix_fw_mqtt_rule }}'
+        state: absent
+      ignore_errors: true
+
+    - name: ROLLBACK | Remove firewall rule {{ scanvix_fw_tcp_rule }}
+      community.windows.win_firewall_rule:
+        name: '{{ scanvix_fw_tcp_rule }}'
+        state: absent
+      ignore_errors: true
+
+    # ── Remove Storm application directory ────────────────────────────────────
+    - name: ROLLBACK | Remove E:\StormEnergyRTU\
+      ansible.windows.win_file:
+        path: '{{ scanvix_install_dir }}'
+        state: absent
+
+    - name: ROLLBACK | Remove E:\StormEnergyRTU.venv\
+      ansible.windows.win_file:
+        path: '{{ scanvix_venv_dir }}'
+        state: absent
+
+    # ── Optional database drop ────────────────────────────────────────────────
+    - name: ROLLBACK | Database — drop STORM_ENERGY_RTU (only if explicitly requested)
+      ansible.windows.win_shell: |
+        $q1 = "ALTER DATABASE [{{ scanvix_database_name }}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;"
+        $q2 = "DROP DATABASE [{{ scanvix_database_name }}];"
+        sqlcmd -S localhost -E -b -Q "$q1 $q2"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Database drop failed (exit $LASTEXITCODE)"
+          exit 1
+        }
+        "Database {{ scanvix_database_name }}: DROPPED"
+      when: rollback_drop_database | bool
+      changed_when: true
+
+    - name: ROLLBACK | Database — skipped (rollback_drop_database=false)
+      ansible.builtin.debug:
+        msg: "Database {{ scanvix_database_name }} was NOT dropped. Set rollback_drop_database=true to drop it."
+      when: not (rollback_drop_database | bool)
+
+    # ── Final confirmation ────────────────────────────────────────────────────
+    - name: ROLLBACK | Summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "ROLLBACK COMPLETE"
+          - "============================================================"
+          - "Storm services   : stopped and removed"
+          - "Storm directories: removed"
+          - "Storm FW rules   : removed"
+          - "Database dropped : {{ rollback_drop_database }}"
+          - "Allipuram        : UNTOUCHED"
+          - "Port 8088        : UNTOUCHED"
+          - "============================================================"

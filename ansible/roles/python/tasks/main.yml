@@ -1,0 +1,74 @@
+---
+- name: Install system packages for Python and ODBC
+  ansible.builtin.package:
+    name:
+      - "python{{ python_version }}"
+      - "python{{ python_version }}-venv"
+      - "python{{ python_version }}-dev"
+      - build-essential
+      - unixodbc-dev
+      - curl
+      - gnupg
+    state: present
+
+- name: Add Microsoft ODBC repository key
+  ansible.builtin.apt_key:
+    url: https://packages.microsoft.com/keys/microsoft.asc
+    state: present
+  when: ansible_os_family == "Debian"
+
+- name: Add Microsoft ODBC repository
+  ansible.builtin.apt_repository:
+    repo: "deb [arch=amd64] https://packages.microsoft.com/ubuntu/{{ ansible_distribution_version }}/prod {{ ansible_distribution_release }} main"
+    state: present
+  when: ansible_os_family == "Debian"
+
+- name: Install ODBC Driver 17 for SQL Server
+  ansible.builtin.package:
+    name: msodbcsql17
+    state: present
+
+- name: Create application user
+  ansible.builtin.user:
+    name:   "{{ app_user }}"
+    group:  "{{ app_group }}"
+    system: true
+    shell:  /sbin/nologin
+    home:   "{{ app_base_dir }}"
+    create_home: false
+
+- name: Create application directories
+  ansible.builtin.file:
+    path:  "{{ item }}"
+    state: directory
+    owner: "{{ app_user }}"
+    group: "{{ app_group }}"
+    mode:  "0750"
+  loop:
+    - "{{ app_base_dir }}"
+    - "{{ app_base_dir }}/backend"
+    - "{{ app_log_dir }}"
+    - "{{ app_cert_dir }}"
+
+- name: Create Python virtual environment
+  ansible.builtin.command:
+    cmd:     "python{{ python_version }} -m venv {{ app_base_dir }}/venv"
+    creates: "{{ app_base_dir }}/venv/bin/activate"
+  become_user: "{{ app_user }}"
+
+- name: Copy backend code
+  ansible.builtin.synchronize:
+    src:     "{{ playbook_dir }}/../backend/"
+    dest:    "{{ app_base_dir }}/backend/"
+    delete:  true
+    rsync_opts:
+      - "--exclude=__pycache__"
+      - "--exclude=*.pyc"
+      - "--exclude=.env"
+
+- name: Install Python dependencies
+  ansible.builtin.pip:
+    requirements: "{{ app_base_dir }}/backend/requirements.txt"
+    virtualenv:   "{{ app_base_dir }}/venv"
+    state: present
+  become_user: "{{ app_user }}"

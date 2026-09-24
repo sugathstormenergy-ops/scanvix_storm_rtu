@@ -1,0 +1,101 @@
+---
+- name: Temporary Mosquitto Discovery - READ ONLY
+  hosts: scanvix109
+  gather_facts: false
+
+  tasks:
+    - name: MQTT DISCOVERY | Collect service, process, ports, config, firewall and install information
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'SilentlyContinue'
+
+        Write-Output "===== A. EXISTING MOSQUITTO SERVICE ====="
+        Get-CimInstance Win32_Service |
+          Where-Object { $_.Name -match 'mosquitto' -or $_.DisplayName -match 'mosquitto' } |
+          Select-Object Name,DisplayName,State,StartMode,StartName,PathName |
+          Format-List | Out-String | Write-Output
+
+        Write-Output "===== B. MOSQUITTO EXECUTABLE ====="
+        $cmd = Get-Command mosquitto.exe -ErrorAction SilentlyContinue
+        if ($cmd) {
+          Write-Output "PATH:$($cmd.Source)"
+          & $cmd.Source --help 2>&1 | Select-Object -First 8 | Out-String | Write-Output
+          (Get-Item $cmd.Source).VersionInfo |
+            Select-Object FileVersion,ProductVersion,ProductName,FileDescription |
+            Format-List | Out-String | Write-Output
+        }
+
+        Get-ChildItem 'C:\Program Files','C:\Program Files (x86)','C:\ProgramData' `
+          -Filter 'mosquitto.exe' -Recurse -ErrorAction SilentlyContinue |
+          Select-Object FullName,Length,LastWriteTime |
+          Format-Table -AutoSize | Out-String | Write-Output
+
+        Write-Output "===== C. CONFIGURATION FILES ====="
+        $dirs = @(
+          'C:\Program Files\mosquitto',
+          'C:\Program Files (x86)\mosquitto',
+          'C:\ProgramData\mosquitto'
+        )
+        Get-ChildItem $dirs -Filter '*.conf' -Recurse -ErrorAction SilentlyContinue |
+          ForEach-Object {
+            Write-Output "CONFIG:$($_.FullName)"
+            Get-Content $_.FullName -ErrorAction SilentlyContinue |
+              Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() -ne '' } |
+              ForEach-Object {
+                if ($_ -match '(?i)(password_file|acl_file)\s+') {
+                  ($_ -replace '(?i)(password_file|acl_file)\s+.*','$1 <REDACTED_PATH>')
+                } else {
+                  $_
+                }
+              } |
+              Write-Output
+          }
+
+        Write-Output "===== D. MOSQUITTO PROCESS ====="
+        Get-CimInstance Win32_Process |
+          Where-Object { $_.Name -ieq 'mosquitto.exe' } |
+          Select-Object ProcessId,Name,ExecutablePath,CommandLine |
+          Format-List | Out-String | Write-Output
+
+        Write-Output "===== E. MQTT PORTS ====="
+        Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+          Where-Object { $_.LocalPort -in @(1883,8883) } |
+          Select-Object LocalAddress,LocalPort,OwningProcess |
+          Format-Table -AutoSize | Out-String | Write-Output
+
+        Write-Output "===== F. FIREWALL RULES ====="
+        Get-NetFirewallRule -ErrorAction SilentlyContinue |
+          Where-Object { $_.DisplayName -match '(?i)mosquitto|mqtt' } |
+          Select-Object DisplayName,Enabled,Direction,Action,Profile |
+          Format-Table -AutoSize | Out-String | Write-Output
+
+        Write-Output "===== G. LOG LOCATIONS ====="
+        Get-ChildItem $dirs -File -Recurse -ErrorAction SilentlyContinue |
+          Where-Object { $_.Name -match '(?i)mosquitto.*\.(log|txt)$' -or $_.Extension -eq '.log' } |
+          Select-Object FullName,Length,LastWriteTime |
+          Format-Table -AutoSize | Out-String | Write-Output
+
+        Write-Output "===== H. INSTALLATION ORIGIN ====="
+        if (Get-Command choco.exe -ErrorAction SilentlyContinue) {
+          choco list --local-only 2>$null |
+            Select-String -Pattern '(?i)mosquitto' |
+            ForEach-Object { "CHOCO:$($_.Line)" }
+        } else {
+          Write-Output "CHOCO:NOT_AVAILABLE"
+        }
+
+        if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
+          winget list --id EclipseFoundation.Mosquitto 2>$null |
+            Select-Object -First 10 | Out-String | Write-Output
+        } else {
+          Write-Output "WINGET:NOT_AVAILABLE"
+        }
+
+        Write-Output "===== I. SAFETY ====="
+        Write-Output "Discovery only: NO service/config/firewall/package/database changes requested."
+      register: mqtt_discovery
+      changed_when: false
+      check_mode: false
+
+    - name: MQTT DISCOVERY | Display report
+      ansible.builtin.debug:
+        msg: "{{ mqtt_discovery.stdout_lines }}"

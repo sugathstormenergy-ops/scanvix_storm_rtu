@@ -1,0 +1,65 @@
+---
+# Storm Energy RTU — Deployment Playbook
+# ========================================
+# Main entry point for full deployment.
+# Idempotent: safe to run multiple times — will not duplicate services,
+# files, firewall rules, or configuration.
+#
+# Prerequisites:
+#   1. Run discover.yml and resolve any port conflicts.
+#   2. Create a Vault-encrypted secrets file:
+#        ansible-vault create secrets.yml
+#      Contents:
+#        scanvix_sql_username: "sa"
+#        scanvix_sql_password: "YOUR_SQL_PASSWORD"
+#        scanvix_mqtt_username: "allipuram_ingest"  # set in group_vars/all.yml
+#        scanvix_mqtt_password: "YOUR_MQTT_PASSWORD"
+#        scanvix_api_secret_key: "YOUR_SECRET_KEY"
+#
+# Usage (interactive Vault password):
+#   ansible-playbook -i inventory/hosts.ini playbooks/deploy.yml \
+#     -e @secrets.yml --ask-vault-pass
+#
+# Secrets are NEVER written to group_vars or source control.
+
+- name: Storm Energy RTU — Full Deployment
+  hosts: scanvix_rtu
+  gather_facts: true
+
+  pre_tasks:
+    - name: DEPLOY | Pre-flight — confirm target host
+      ansible.builtin.debug:
+        msg:
+          - "Target   : {{ ansible_hostname }} ({{ ansible_host }})"
+          - "Install  : {{ scanvix_install_dir }}"
+          - "Venv     : {{ scanvix_venv_dir }}"
+          - "API port : {{ scanvix_api_port }}"
+          - "TCP port : {{ scanvix_tcp_port }}"
+          - "DB       : {{ scanvix_database_name }} on {{ scanvix_sql_server }}"
+
+    - name: DEPLOY | Pre-flight — verify port 8090 is free
+      ansible.windows.win_shell: |
+        $inUse = netstat -ano | Select-String ':{{ scanvix_api_port }} '
+        if ($inUse) {
+          Write-Error "Port {{ scanvix_api_port }} is already in use. Resolve before deploying."
+          exit 1
+        }
+        "Port {{ scanvix_api_port }}: FREE"
+      register: port_check
+      changed_when: false
+      failed_when: port_check.rc != 0
+
+  roles:
+    - role: python
+    - role: storm_rtu
+    - role: database
+    - role: mqtt
+    - role: services
+    - role: firewall
+
+  post_tasks:
+    - name: DEPLOY | Post-deploy — import verify playbook tasks
+      ansible.builtin.debug:
+        msg:
+          - "Deployment complete."
+          - "Run verification: ansible-playbook -i inventory/hosts.ini playbooks/verify.yml"

@@ -1,0 +1,20 @@
+---
+# Runs from the project's playbooks/ dir. playbook_dir = .../ansible/scanvix_rtu/playbooks
+# so the project roles/ is one level up. This does not depend on ansible.cfg.
+- name: STEP 1 connectivity gate
+  hosts: scanvix109
+  gather_facts: false
+  tasks:
+    - ansible.windows.win_ping:
+
+- name: Deploy read-only Scanvix TCP log viewer
+  hosts: scanvix109
+  gather_facts: true
+  vars:
+    project_roles_dir: "{{ playbook_dir }}/../roles"
+  tasks:
+    - name: Load tcp_log_viewer from the project roles/ dir (path-independent of ansible.cfg)
+      ansible.builtin.include_role:
+        name: tcp_log_viewer
+      vars:
+        ansible_roles_path: "{{ project_roles_dir }}"

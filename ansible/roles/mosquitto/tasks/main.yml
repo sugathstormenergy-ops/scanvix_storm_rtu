@@ -1,0 +1,31 @@
+---
+- name: Install Mosquitto broker
+  ansible.builtin.package:
+    name:
+      - mosquitto
+      - mosquitto-clients
+    state: present
+
+- name: Deploy Mosquitto configuration
+  ansible.builtin.template:
+    src:   mosquitto.conf.j2
+    dest:  /etc/mosquitto/mosquitto.conf
+    owner: mosquitto
+    group: mosquitto
+    mode:  "0640"
+  notify: restart mosquitto
+
+- name: Deploy Mosquitto password file (from vault)
+  ansible.builtin.template:
+    src:   passwd.j2
+    dest:  /etc/mosquitto/passwd
+    owner: mosquitto
+    group: mosquitto
+    mode:  "0640"
+  notify: restart mosquitto
+
+- name: Enable and start Mosquitto
+  ansible.builtin.systemd:
+    name:    mosquitto
+    enabled: true
+    state:   started

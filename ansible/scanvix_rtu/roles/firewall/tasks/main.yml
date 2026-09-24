@@ -1,0 +1,71 @@
+---
+# Storm Energy RTU — Firewall Role
+#
+# SAFETY POLICY:
+#   - Creates ONLY named Storm Energy rules.
+#   - Never modifies, deletes, or disables existing rules.
+#   - Never opens broad port ranges.
+#   - Never disables the firewall.
+#   - Port 8088 is never touched.
+
+- name: FIREWALL | Verify port 8090 is not already in use by another process
+  ansible.windows.win_shell: |
+    $inUse = netstat -ano | Select-String ':{{ scanvix_api_port }} '
+    if ($inUse) {
+      Write-Warning "Port {{ scanvix_api_port }} is already in use. Check before opening firewall rule."
+    } else {
+      "Port {{ scanvix_api_port }}: available"
+    }
+  register: port_check_fw
+  changed_when: false
+
+- name: FIREWALL | Port availability report
+  ansible.builtin.debug:
+    msg: "{{ port_check_fw.stdout_lines }}"
+
+- name: FIREWALL | Create rule {{ scanvix_fw_api_rule }}
+  community.windows.win_firewall_rule:
+    name:      '{{ scanvix_fw_api_rule }}'
+    localport: '{{ scanvix_api_port }}'
+    action:    allow
+    direction: in
+    protocol:  tcp
+    state:     present
+    enabled:   true
+    description: 'Storm Energy RTU — FastAPI HTTP endpoint (port {{ scanvix_api_port }})'
+
+- name: FIREWALL | Create rule {{ scanvix_fw_mqtt_rule }}
+  community.windows.win_firewall_rule:
+    name:      '{{ scanvix_fw_mqtt_rule }}'
+    localport: '{{ scanvix_mqtt_port }}'
+    action:    allow
+    direction: in
+    protocol:  tcp
+    state:     present
+    enabled:   true
+    description: 'Storm Energy RTU — Mosquitto MQTT broker (port {{ scanvix_mqtt_port }})'
+
+- name: FIREWALL | Create rule {{ scanvix_fw_tcp_rule }}
+  community.windows.win_firewall_rule:
+    name:      '{{ scanvix_fw_tcp_rule }}'
+    localport: '{{ scanvix_tcp_port }}'
+    action:    allow
+    direction: in
+    protocol:  tcp
+    state:     present
+    enabled:   true
+    description: 'Storm Energy RTU — TCP telemetry listener (port {{ scanvix_tcp_port }})'
+
+- name: FIREWALL | Confirm rules created
+  ansible.windows.win_shell: |
+    $rules = @('{{ scanvix_fw_api_rule }}','{{ scanvix_fw_mqtt_rule }}','{{ scanvix_fw_tcp_rule }}')
+    foreach ($r in $rules) {
+      $rule = Get-NetFirewallRule -DisplayName $r -ErrorAction SilentlyContinue
+      if ($rule) { "OK  $r  Enabled=$($rule.Enabled)" } else { "MISSING  $r" }
+    }
+  register: fw_confirm
+  changed_when: false
+
+- name: FIREWALL | Rules confirmation
+  ansible.builtin.debug:
+    msg: "{{ fw_confirm.stdout_lines }}"

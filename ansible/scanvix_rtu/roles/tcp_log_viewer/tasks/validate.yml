@@ -1,0 +1,29 @@
+---
+- name: Compile the viewer + main.py
+  ansible.windows.win_shell: >
+    & '{{ python_exe }}' -m py_compile '{{ viewer_dest_dir }}\tcp_logs.py' '{{ main_py }}'
+  args:
+    chdir: "{{ code_root }}"
+  changed_when: false
+  register: pycompile
+  failed_when: pycompile.rc != 0
+
+- name: Import the viewer module (defines routes; SELECT-only, no side effects)
+  ansible.windows.win_shell: "& '{{ python_exe }}' -c \"import app.api.tcp_logs as m; print('ROUTER_OK', [r.path for r in m.router.routes])\""
+  args:
+    chdir: "{{ code_root }}"
+  changed_when: false
+  register: router_import
+  failed_when: "'ROUTER_OK' not in router_import.stdout"
+
+- name: Validate FastAPI application creation (import app.main)
+  ansible.windows.win_shell: "& '{{ python_exe }}' -c \"import app.main as m; print('APP_OK', len(m.app.routes))\""
+  args:
+    chdir: "{{ code_root }}"
+  changed_when: false
+  register: app_import
+  failed_when: "'APP_OK' not in app_import.stdout"
+
+- name: Validation summary
+  ansible.builtin.debug:
+    msg: "PY_COMPILE=PASS {{ router_import.stdout | trim }} {{ app_import.stdout | trim }}"

@@ -1,0 +1,110 @@
+---
+# READ-ONLY diagnostic — proves svc_ansible's effective database identity and
+# SELECT access to STORM_ENERGY_RTU via Windows Integrated Authentication.
+#
+# allipuram_ingest / SQL authentication is intentionally NOT tested here.
+# svc_ansible's access has already been confirmed sufficient; this diagnostic
+# exists only to demonstrate that connection concretely and read one table.
+#
+# Every SQL statement is a SELECT. No CREATE/ALTER/INSERT/UPDATE/DELETE/
+# MERGE/DROP/TRUNCATE/GRANT/DENY/REVOKE/EXEC anywhere in this file. No user,
+# permission, .env, service, MQTT, or firewall changes. No password of any
+# kind is used, prompted for, or referenced -- Integrated Security relies on
+# the OS token of the account this WinRM session already authenticates as
+# (confirmed to be svc_ansible via inventory/hosts.ini: ansible_user=.\svc_ansible).
+#
+#   cd /mnt/e/scanvix_RTU/storm-energy-rtu/ansible/scanvix_rtu
+#   export ANSIBLE_ROLES_PATH="$(pwd)/roles"
+#   ansible-playbook -i inventory/hosts.ini playbooks/db_dual_identity_check.yml --syntax-check
+#   ansible-playbook -i inventory/hosts.ini playbooks/db_dual_identity_check.yml
+
+- name: READ-ONLY svc_ansible identity + access diagnostic — STORM_ENERGY_RTU
+  hosts: scanvix109
+  gather_facts: false
+  vars:
+    winauth_server: 'DESKTOP-FL70N9E\SQLEXPRESS,1433'
+    database_name:  'STORM_ENERGY_RTU'
+
+  tasks:
+
+    - name: Connectivity gate
+      ansible.windows.win_ping: {}
+
+    - name: CHECK 1 — svc_ansible effective identity via Windows Integrated Auth
+      check_mode: false
+      ansible.windows.win_shell: |
+        function Read-RowsSafely($reader) {
+          while ($reader.Read()) {
+            $parts = @()
+            for ($i = 0; $i -lt $reader.FieldCount; $i++) {
+              $col = $reader.GetName($i)
+              $val = if ($reader.IsDBNull($i)) { "NULL" } else { [Convert]::ToString($reader.GetValue($i)) }
+              $parts += "$col=$val"
+            }
+            "RESULT|" + ($parts -join "|")
+          }
+        }
+
+        try {
+          $conn = New-Object System.Data.SqlClient.SqlConnection
+          $conn.ConnectionString = "Server={{ winauth_server }};Database={{ database_name }};Integrated Security=True;Connect Timeout=10"
+          $conn.Open()
+
+          $cmd = $conn.CreateCommand()
+          $cmd.CommandText = "SELECT SUSER_SNAME() AS SuserSname, ORIGINAL_LOGIN() AS OriginalLogin, USER_NAME() AS UserName, DB_NAME() AS DatabaseName, HAS_DBACCESS('{{ database_name }}') AS HasDbAccess, SERVERPROPERTY('ServerName') AS ServerName, SERVERPROPERTY('ProductVersion') AS ProductVersion;"
+          $r = $cmd.ExecuteReader()
+          Read-RowsSafely $r
+          $r.Close()
+
+          $conn.Close()
+          "RESULT|Status=SUCCESS"
+        } catch {
+          "RESULT|Status=FAILED|Error=$($_.Exception.GetType().Name): $($_.Exception.Message)"
+        }
+      register: check1
+      changed_when: false
+
+    - name: CHECK 2 — svc_ansible read access to dbo.DeviceEvents
+      check_mode: false
+      ansible.windows.win_shell: |
+        function Read-RowsSafely($reader) {
+          while ($reader.Read()) {
+            $parts = @()
+            for ($i = 0; $i -lt $reader.FieldCount; $i++) {
+              $col = $reader.GetName($i)
+              $val = if ($reader.IsDBNull($i)) { "NULL" } else { [Convert]::ToString($reader.GetValue($i)) }
+              $parts += "$col=$val"
+            }
+            "RESULT|" + ($parts -join "|")
+          }
+        }
+
+        try {
+          $conn = New-Object System.Data.SqlClient.SqlConnection
+          $conn.ConnectionString = "Server={{ winauth_server }};Database={{ database_name }};Integrated Security=True;Connect Timeout=10"
+          $conn.Open()
+
+          $cmd = $conn.CreateCommand()
+          $cmd.CommandText = "SELECT COUNT(*) AS DeviceEventsCount FROM dbo.DeviceEvents;"
+          $r = $cmd.ExecuteReader()
+          Read-RowsSafely $r
+          $r.Close()
+
+          $conn.Close()
+          "RESULT|Status=SUCCESS"
+        } catch {
+          "RESULT|Status=FAILED|Error=$($_.Exception.GetType().Name): $($_.Exception.Message)"
+        }
+      register: check2
+      changed_when: false
+
+    - name: FINAL REPORT
+      ansible.builtin.debug:
+        msg:
+          - "=== CHECK 1 -- svc_ansible identity via Windows Integrated Auth @ {{ winauth_server }} ==="
+          - "{{ check1.stdout_lines }}"
+          - ""
+          - "=== CHECK 2 -- svc_ansible read access to dbo.DeviceEvents in {{ database_name }} ==="
+          - "{{ check2.stdout_lines }}"
+          - ""
+          - "=== NO DATABASE CHANGES MADE -- every statement above is SELECT-only. ==="

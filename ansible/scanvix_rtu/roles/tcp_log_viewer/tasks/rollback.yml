@@ -1,0 +1,12 @@
+---
+- name: Restore main.py from backup after failed edit/validation
+  ansible.windows.win_copy:
+    src: "{{ backup_dir }}\\main.py"
+    dest: "{{ main_py }}"
+    remote_src: true
+
+- name: Abort before restarting the service
+  ansible.builtin.fail:
+    msg: >-
+      Registration/validation FAILED. main.py restored from {{ backup_dir }}\main.py;
+      service NOT restarted. Check viewer_import / anchors against discovery output.

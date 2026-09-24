@@ -1,0 +1,33 @@
+# Storm Energy RTU Platform — Mosquitto configuration
+# Managed by Ansible — do not edit manually
+
+pid_file /run/mosquitto/mosquitto.pid
+persistence true
+persistence_location /var/lib/mosquitto/
+
+log_dest file /var/log/mosquitto/mosquitto.log
+log_type all
+log_timestamp true
+
+# ── Plain MQTT (port 1883) ────────────────────────────────────────────────────
+listener {{ mqtt_port }}
+allow_anonymous false
+password_file /etc/mosquitto/passwd
+
+{% if mqtt_tls_enabled %}
+# ── MQTT over TLS (port 8883) ─────────────────────────────────────────────────
+listener {{ mqtt_tls_port }}
+cafile   {{ app_cert_dir }}/ca.crt
+certfile {{ app_cert_dir }}/server.crt
+keyfile  {{ app_cert_dir }}/server.key
+tls_version tlsv1.2
+require_certificate false
+allow_anonymous false
+password_file /etc/mosquitto/passwd
+{% endif %}
+
+# Maximum QoS level
+max_qos 1
+
+# Retain messages: disabled (telemetry is always live or store-and-forward)
+retained_persistence true

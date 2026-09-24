@@ -1,0 +1,228 @@
+---
+# Storm Energy RTU — READ-ONLY production MQTT/TLS migration inventory
+#
+# Purpose: gather facts needed to plan a future migration of the MQTT broker
+# to production MQTT-over-TLS on TCP 8883. This playbook is STRICTLY
+# READ-ONLY: it makes no service/config/firewall/credential/certificate/
+# software changes of any kind. Every task below uses only inspection
+# cmdlets (Get-Service, Get-Process/Get-CimInstance, Get-NetTCPConnection,
+# Get-NetFirewallRule, Get-Content, Get-Acl, nssm get) or read-only file
+# grep against the local Ansible source tree.
+#
+# Does NOT touch: Allipuram/PFCMD receiver (port 8088), IIS, StormEnergyRTU-
+# API service, the router, SQL/DB data, any credential or certificate file,
+# any firewall rule. Nothing is started, stopped, or restarted.
+#
+# Modeled on the existing, already-proven read-only pattern in
+# playbooks/discovery/mqtt_discover.yml (service/process/port/firewall/
+# config enumeration with password_file/acl_file path-only redaction) —
+# extended here to also cover 1884/1885/8883, StormMosquitto specifically,
+# NSSM config, cert/key file locations+ACLs, and live connection checks.
+
+- name: Storm Energy RTU — READ-ONLY MQTT/TLS migration inventory
+  hosts: scanvix109
+  gather_facts: false
+
+  vars:
+    scanvix_nssm_exe: 'D:\AllipuramPFCMD\Receiver\nssm.exe'   # shared binary path, read-only usage only
+
+  tasks:
+
+    # ── 1. Mosquitto-related Windows services ───────────────────────────────
+    - name: INV | Mosquitto/Storm-related Windows services
+      ansible.windows.win_shell: |
+        Write-Output "===== 1. SERVICES ====="
+        Get-CimInstance Win32_Service |
+          Where-Object { $_.Name -match '(?i)mosquitto|storm' -or $_.DisplayName -match '(?i)mosquitto|storm' } |
+          Select-Object Name,DisplayName,State,StartMode,PathName |
+          Format-List | Out-String | Write-Output
+      register: inv_services
+      changed_when: false
+
+    - name: INV | 1. Services report
+      ansible.builtin.debug:
+        msg: "{{ inv_services.stdout }}"
+
+    # ── 2. Running mosquitto.exe processes ───────────────────────────────────
+    - name: INV | Running mosquitto.exe processes
+      ansible.windows.win_shell: |
+        Write-Output "===== 2. PROCESSES ====="
+        Get-CimInstance Win32_Process |
+          Where-Object { $_.Name -ieq 'mosquitto.exe' } |
+          Select-Object ProcessId,Name,ExecutablePath,CommandLine |
+          Format-List | Out-String | Write-Output
+      register: inv_processes
+      changed_when: false
+
+    - name: INV | 2. Processes report
+      ansible.builtin.debug:
+        msg: "{{ inv_processes.stdout }}"
+
+    # ── 3. TCP listeners for 1883 / 1884 / 1885 / 8883 ───────────────────────
+    - name: INV | TCP listeners for 1883/1884/1885/8883
+      ansible.windows.win_shell: |
+        Write-Output "===== 3. TCP LISTENERS ====="
+        Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+          Where-Object { $_.LocalPort -in @(1883,1884,1885,8883) } |
+          ForEach-Object {
+            $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+            [PSCustomObject]@{
+              LocalAddress = $_.LocalAddress
+              LocalPort    = $_.LocalPort
+              PID          = $_.OwningProcess
+              ProcessName  = $p.ProcessName
+            }
+          } | Format-Table -AutoSize | Out-String | Write-Output
+      register: inv_ports
+      changed_when: false
+
+    - name: INV | 3. TCP listeners report
+      ansible.builtin.debug:
+        msg: "{{ inv_ports.stdout }}"
+
+    # ── 4. Firewall rules relating to MQTT/Mosquitto/these 4 ports ──────────
+    - name: INV | Firewall rules for MQTT/Mosquitto/relevant ports
+      ansible.windows.win_shell: |
+        Write-Output "===== 4. FIREWALL RULES ====="
+        $rules = Get-NetFirewallRule -ErrorAction SilentlyContinue |
+          Where-Object { $_.DisplayName -match '(?i)mosquitto|mqtt|storm' }
+        $results = @()
+        foreach ($r in $rules) {
+          $ports = ($r | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue).LocalPort -join ','
+          $results += [PSCustomObject]@{
+            DisplayName = $r.DisplayName
+            Enabled     = $r.Enabled
+            Direction   = $r.Direction
+            Action      = $r.Action
+            Profile     = $r.Profile
+            LocalPort   = $ports
+          }
+        }
+        $results | Format-Table -AutoSize -Wrap | Out-String | Write-Output
+      register: inv_firewall
+      changed_when: false
+
+    - name: INV | 4. Firewall rules report
+      ansible.builtin.debug:
+        msg: "{{ inv_firewall.stdout }}"
+
+    # ── 5/6. Active Mosquitto config (StormMosquitto), REDACTED ─────────────
+    - name: INV | Locate + print active StormMosquitto config (redacted)
+      ansible.windows.win_shell: |
+        Write-Output "===== 5/6. ACTIVE CONFIG (redacted) ====="
+        $n = '{{ scanvix_nssm_exe }}'
+        $args = (& $n get StormMosquitto AppParameters 2>&1) -join ' '
+        Write-Output "NSSM AppParameters: $args"
+
+        $candidates = @('C:\Program Files\mosquitto\mosquitto_storm.conf')
+        $args -split '\s+' | Where-Object { $_ -match '\.conf$' } | ForEach-Object { $candidates += $_ }
+        $candidates = $candidates | Select-Object -Unique
+
+        foreach ($cfgPath in $candidates) {
+          if (Test-Path $cfgPath) {
+            Write-Output "CONFIG_FILE:$cfgPath"
+            Get-Content $cfgPath -ErrorAction SilentlyContinue |
+              Where-Object { $_.Trim() -ne '' } |
+              ForEach-Object {
+                if ($_ -match '(?i)^\s*(password_file|acl_file|keyfile|certfile|cafile|psk_file)\s+(.*)') {
+                  "$($Matches[1]) <REDACTED_PATH_PRESENT>"
+                } else {
+                  $_
+                }
+              } | Write-Output
+          } else {
+            Write-Output "NOT_FOUND:$cfgPath"
+          }
+        }
+      register: inv_config
+      changed_when: false
+
+    - name: INV | 5/6. Active config report (redacted)
+      ansible.builtin.debug:
+        msg: "{{ inv_config.stdout }}"
+
+    # ── 7. Credential / certificate file locations + ACLs (no contents) ─────
+    - name: INV | Locate storm_passwd/bench_passwd/TLS cert-key-CA files + ACLs
+      ansible.windows.win_shell: |
+        Write-Output "===== 7. CREDENTIAL / CERTIFICATE FILES (names + ACL only) ====="
+        $dirs = @(
+          'C:\ProgramData\StormEnergyRTU\Mosquitto',
+          'C:\Program Files\mosquitto',
+          'C:\ProgramData\mosquitto',
+          'C:\ProgramData\StormEnergyRTU\certs',
+          'C:\ProgramData\StormEnergyRTU'
+        )
+        $patterns = @('*passwd*','*.crt','*.pem','*.key','*.csr','*ca*.pem','*ca*.crt')
+        foreach ($d in $dirs) {
+          if (Test-Path $d) {
+            foreach ($pat in $patterns) {
+              Get-ChildItem -Path $d -Filter $pat -Recurse -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                  $acl = Get-Acl $_.FullName -ErrorAction SilentlyContinue
+                  $owner = $acl.Owner
+                  $access = ($acl.Access | ForEach-Object { "$($_.IdentityReference):$($_.FileSystemRights)" }) -join '; '
+                  Write-Output "FILE:$($_.FullName) SIZE:$($_.Length) OWNER:$owner ACL:[$access]"
+                }
+            }
+          }
+        }
+        Write-Output "NOTE: file contents/values were never read or printed."
+      register: inv_creds
+      changed_when: false
+
+    - name: INV | 7. Credential/certificate files report
+      ansible.builtin.debug:
+        msg: "{{ inv_creds.stdout }}"
+
+    # ── 8. StormMosquitto NSSM configuration ─────────────────────────────────
+    - name: INV | StormMosquitto NSSM configuration (read-only)
+      ansible.windows.win_shell: |
+        Write-Output "===== 8. NSSM CONFIG (StormMosquitto) ====="
+        $n = '{{ scanvix_nssm_exe }}'
+        foreach ($key in @('Application','AppDirectory','AppParameters','AppStdout','AppStderr','AppExit','Start')) {
+          $val = (& $n get StormMosquitto $key 2>&1) -join ' '
+          Write-Output "$key : $val"
+        }
+      register: inv_nssm
+      changed_when: false
+
+    - name: INV | 8. NSSM config report
+      ansible.builtin.debug:
+        msg: "{{ inv_nssm.stdout }}"
+
+    # ── 11. Current active connections to the 4 endpoints ───────────────────
+    - name: INV | Current established connections on 1883/1885
+      ansible.windows.win_shell: |
+        Write-Output "===== 11. ACTIVE CONNECTIONS (1883/1885) ====="
+        Get-NetTCPConnection -ErrorAction SilentlyContinue |
+          Where-Object { ($_.LocalPort -in @(1883,1885) -or $_.RemotePort -in @(1883,1885)) -and $_.State -ne 'Listen' } |
+          ForEach-Object {
+            $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+            [PSCustomObject]@{
+              LocalAddress=$_.LocalAddress; LocalPort=$_.LocalPort
+              RemoteAddress=$_.RemoteAddress; RemotePort=$_.RemotePort
+              State=$_.State; PID=$_.OwningProcess; ProcessName=$p.ProcessName
+            }
+          } | Format-Table -AutoSize | Out-String | Write-Output
+
+        Write-Output "Note: this is a point-in-time snapshot only, taken read-only."
+      register: inv_conns
+      changed_when: false
+
+    - name: INV | 11. Active connections report
+      ansible.builtin.debug:
+        msg: "{{ inv_conns.stdout }}"
+
+    # ── Safety confirmation ───────────────────────────────────────────────────
+    - name: INV | Confirm Allipuram (8088) untouched — read-only
+      ansible.windows.win_shell: |
+        $c = Get-NetTCPConnection -LocalPort 8088 -State Listen -ErrorAction SilentlyContinue
+        if ($c) { "8088 still LISTENING, PID $($c.OwningProcess) (untouched by this inventory)" } else { "8088 NOT LISTENING (pre-existing state, unrelated to this playbook)" }
+      register: inv_8088
+      changed_when: false
+
+    - name: INV | Safety confirmation
+      ansible.builtin.debug:
+        msg:
+          - "{{ inv_8088.stdout | trim }}"
+          - "This playbook is read-only. No service, config, firewall, credential, certificate, or software change was made."

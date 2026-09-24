@@ -1,0 +1,148 @@
+---
+# Config-test + start ONLY. Does NOT touch the config file (the BOM fix from
+# encoding_fix_20260915T123709 already applied and stays as-is), does NOT
+# create another backup, does NOT redo the 1885 cleanup. Uses the CORRECT
+# Mosquitto 2.1.2 flag: --test-config (not -t, which that version rejects).
+#
+#   cd /mnt/e/scanvix_RTU/storm-energy-rtu/ansible/scanvix_rtu
+#   export ANSIBLE_ROLES_PATH="$(pwd)/roles"
+#   ansible-playbook -i inventory/hosts.ini playbooks/mqtt_start_after_fix.yml --syntax-check
+#   ansible-playbook -i inventory/hosts.ini playbooks/mqtt_start_after_fix.yml
+- name: Connectivity gate
+  hosts: scanvix109
+  gather_facts: false
+  tasks: [ { ansible.windows.win_ping: {} } ]
+
+- name: Test config (--test-config) and start ONLY StormMosquitto
+  hosts: scanvix109
+  gather_facts: false
+  vars:
+    active_conf: 'C:\ProgramData\StormEnergyRTU\Mosquitto\mosquitto_storm.conf'
+    mosquitto_exe: 'C:\Program Files\Mosquitto\mosquitto.exe'
+    mosquitto_service: 'StormMosquitto'
+
+  tasks:
+    - name: 1. Confirm the active config exists (read-only) — no rewrite
+      ansible.windows.win_stat:
+        path: "{{ active_conf }}"
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: conf_stat
+    - ansible.builtin.assert:
+        that: conf_stat.stat.exists
+        fail_msg: "ACTIVE CONFIG NOT FOUND: {{ active_conf }}. STOPPING — no changes made."
+
+    - name: Sanity pre-check — confirm the file is in the expected already-fixed
+             state (no BOM, 1883 present, 1885 absent). READ-ONLY. If this does
+             NOT match, STOP and report rather than silently proceeding or rewriting.
+      ansible.windows.win_shell: |
+        $b = [System.IO.File]::ReadAllBytes('{{ active_conf }}')
+        $hasBom = ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)
+        "HAS_BOM=" + $hasBom
+        "1883_PRESENT=" + [bool](Select-String -Path '{{ active_conf }}' -Pattern '^\s*listener\s+1883\s+127\.0\.0\.1\s*$' -Quiet)
+        "1885_PRESENT=" + [bool](Select-String -Path '{{ active_conf }}' -Pattern '^\s*listener\s+1885\b' -Quiet)
+      changed_when: false
+      register: precheck
+
+    - name: STOP if the config is NOT in the expected post-fix state (unexpected change) — no auto-fix
+      ansible.builtin.fail:
+        msg: >-
+          Config is not in the expected state (BOM present or 1883/1885 unexpected).
+          NOT modifying it automatically. Evidence: {{ precheck.stdout_lines }}.
+          STOPPING for manual review.
+      when: >
+        ('HAS_BOM=True' in precheck.stdout) or
+        ('1883_PRESENT=True' not in precheck.stdout) or
+        ('1885_PRESENT=False' not in precheck.stdout)
+
+    - name: 3. Run `mosquitto.exe -c <config> --test-config` (does NOT start the broker)
+      ansible.windows.win_command: >
+        "{{ mosquitto_exe }}" -c "{{ active_conf }}" --test-config
+      register: conf_test
+      changed_when: false
+      failed_when: false   # we branch on rc ourselves so we control stop/report
+
+    - name: 5. STOP — --test-config failed; do NOT start/restart the service
+      when: conf_test.rc != 0
+      ansible.builtin.fail:
+        msg: >-
+          MOSQUITTO --test-config FAILED (rc={{ conf_test.rc }}). Service was NOT
+          started. Config file was NOT modified. stdout: {{ conf_test.stdout }}
+          stderr: {{ conf_test.stderr }}
+
+    - name: 4. --test-config passed — start ONLY StormMosquitto (never StormEnergyRTU-API)
+      ansible.windows.win_service:
+        name: "{{ mosquitto_service }}"
+        state: started
+      register: svc_start
+
+    - name: Wait for StormMosquitto to report Running
+      ansible.windows.win_shell: "(Get-Service '{{ mosquitto_service }}').Status"
+      changed_when: false
+      register: svc_status
+      retries: 6
+      delay: 3
+      until: svc_status.stdout is search('Running')
+
+    # ---------------- VALIDATION (all read-only) ----------------
+    - name: Listener check — 1883/1885/8883
+      ansible.windows.win_shell: |
+        Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+          Where-Object { $_.LocalPort -in 1883,1885,8883 } |
+          Select-Object LocalAddress,LocalPort,OwningProcess | Format-Table | Out-String
+      changed_when: false
+      register: ports
+
+    - name: Mosquitto process count (must be exactly 1)
+      ansible.windows.win_shell: "(Get-Process mosquitto -ErrorAction SilentlyContinue | Measure-Object).Count"
+      changed_when: false
+      register: proc_count
+
+    - name: TCP 9000 / API 8090 / StormEnergyRTU-API — confirm untouched
+      ansible.windows.win_shell: |
+        "TCP9000=" + (@(Get-NetTCPConnection -State Listen -LocalPort 9000 -EA SilentlyContinue).Count)
+        "API8090=" + (@(Get-NetTCPConnection -State Listen -LocalPort 8090 -EA SilentlyContinue).Count)
+        "StormEnergyRTU-API=" + (Get-Service StormEnergyRTU-API -EA SilentlyContinue).Status
+      changed_when: false
+      register: untouched
+
+    - name: Confirm 1883 preserved / 1885 absent (post-start)
+      ansible.windows.win_shell: |
+        "1883_PRESENT=" + [bool](Select-String -Path '{{ active_conf }}' -Pattern '^\s*listener\s+1883\s+127\.0\.0\.1\s*$' -Quiet)
+        "1885_PRESENT=" + [bool](Select-String -Path '{{ active_conf }}' -Pattern '^\s*listener\s+1885\b' -Quiet)
+      changed_when: false
+      register: conf_check
+
+    - name: Hard assertions — STOP (no further action) if anything is off
+      ansible.builtin.assert:
+        that:
+          - conf_test.rc == 0
+          - "'1883' in ports.stdout"
+          - proc_count.stdout | trim | int == 1
+          - svc_status.stdout is search('Running')
+          - "'TCP9000=1' in untouched.stdout"
+          - "'API8090=1' in untouched.stdout"
+          - "'StormEnergyRTU-API=Running' in untouched.stdout"
+          - "'1883_PRESENT=True' in conf_check.stdout"
+          - "'1885_PRESENT=False' in conf_check.stdout"
+        fail_msg: >-
+          VALIDATION FAILED. STOPPING — no further automatic action. Evidence:
+          ports={{ ports.stdout }} proc_count={{ proc_count.stdout }}
+          svc_status={{ svc_status.stdout }} untouched={{ untouched.stdout }}
+          conf_check={{ conf_check.stdout }}
+
+    - name: FINAL REPORT
+      ansible.builtin.debug:
+        msg:
+          - "PLAYBOOK CHANGE      : test command fixed from '-t' to '--test-config' (Mosquitto 2.1.2 does not support -t)"
+          - "CONFIG FILE          : NOT modified this run (sha256={{ conf_stat.stat.checksum }})"
+          - "--TEST-CONFIG RESULT : {{ 'PASS' if conf_test.rc == 0 else 'FAIL' }} (rc={{ conf_test.rc }})"
+          - "--TEST-CONFIG OUTPUT : {{ conf_test.stdout_lines + conf_test.stderr_lines }}"
+          - "STORMMOSQUITTO       : {{ svc_status.stdout | trim }}"
+          - "1883                 : {{ 'LISTENING' if '1883' in ports.stdout else 'NOT LISTENING' }}"
+          - "1885                 : {{ 'NOT LISTENING' if '1885' not in ports.stdout else 'STILL LISTENING (unexpected)' }}"
+          - "8883                 : {{ 'NOT LISTENING' if '8883' not in ports.stdout else 'LISTENING (unexpected)' }}"
+          - "MOSQUITTO PROC COUNT : {{ proc_count.stdout | trim }}"
+          - "TCP 9000             : {{ untouched.stdout_lines | select('search','TCP9000') | list }}"
+          - "API 8090             : {{ untouched.stdout_lines | select('search','API8090') | list }}"
+          - "STORMENERGYRTU-API   : {{ untouched.stdout_lines | select('search','StormEnergyRTU-API') | list }}"

@@ -1,0 +1,50 @@
+---
+# Storm Energy RTU — Canonical Group Variables
+# =============================================
+# Location: inventory/group_vars/all.yml
+# Ansible loads this from the inventory directory — always found.
+#
+# NO secrets in this file. Supply at runtime via Vault or --extra-vars.
+
+# ── Directory layout ──────────────────────────────────────────────────────────
+scanvix_install_dir:   'E:\StormEnergyRTU'
+scanvix_app_dir:       'E:\StormEnergyRTU\app'
+scanvix_config_dir:    'E:\StormEnergyRTU\config'
+scanvix_logs_dir:      'E:\StormEnergyRTU\logs'
+scanvix_scripts_dir:   'E:\StormEnergyRTU\scripts'
+scanvix_venv_dir:      'E:\StormEnergyRTU.venv'
+scanvix_config_file:   'E:\StormEnergyRTU\app\.env'
+
+# Application source (read-only — never modified by Ansible)
+scanvix_source_dir:    'E:\scanvix_RTU\storm-energy-rtu\backend'
+scanvix_db_script_dir: 'E:\scanvix_RTU\storm-energy-rtu\database'
+
+# ── Network ports ─────────────────────────────────────────────────────────────
+scanvix_api_port:  8090    # Storm API  — must NOT conflict with 8088
+scanvix_mqtt_port: 1883    # Mosquitto  — standard MQTT
+scanvix_tcp_port:  9000    # TCP listener
+
+# ── Database ──────────────────────────────────────────────────────────────────
+scanvix_sql_instance:  '.\SQLEXPRESS'
+scanvix_sql_server:    'DESKTOP-FL70N9E\SQLEXPRESS'
+scanvix_database_name: 'STORM_ENERGY_RTU'
+
+# ── MQTT ─────────────────────────────────────────────────────────────────────
+scanvix_mqtt_host: '127.0.0.1'
+
+# ── Windows service names ─────────────────────────────────────────────────────
+scanvix_api_service_name:  'StormEnergyRTU-API'
+scanvix_mqtt_service_name: 'StormEnergyRTU-MQTT'
+scanvix_tcp_service_name:  'StormEnergyRTU-TCP'
+
+# ── Firewall rule names ───────────────────────────────────────────────────────
+scanvix_fw_api_rule:  'StormEnergyRTU-API-8090'
+scanvix_fw_mqtt_rule: 'StormEnergyRTU-MQTT'
+scanvix_fw_tcp_rule:  'StormEnergyRTU-TCP'
+
+# ── Python / virtual environment ──────────────────────────────────────────────
+# python role resolves the real path at runtime after winget install;
+# these are the derived venv-relative executables — always correct.
+scanvix_pip_exe:      '{{ scanvix_venv_dir }}\Scripts\pip.exe'
+scanvix_venv_python:  '{{ scanvix_venv_dir }}\Scripts\python.exe'
+scanvix_uvicorn_exe:  '{{ scanvix_venv_dir }}\Scripts\uvicorn.exe'

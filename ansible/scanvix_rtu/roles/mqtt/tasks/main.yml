@@ -1,0 +1,388 @@
+---
+# Storm Energy RTU — MQTT Role
+#
+# POLICY:
+#   If Mosquitto is ALREADY INSTALLED and RUNNING on .109:
+#     - Do NOT replace it.
+#     - Do NOT overwrite its configuration.
+#     - Do NOT restart it.
+#     - Determine whether Storm can share the existing broker.
+#     - If a conflict exists, this role aborts with a clear message.
+#
+#   If Mosquitto is NOT installed:
+#     - Install Mosquitto via winget (Windows Package Manager).
+#     - Deploy a Storm-dedicated configuration.
+#     - Register as a Windows service.
+#
+# To override and force a separate Mosquitto instance even when one exists,
+# set: scanvix_mqtt_skip_install: true
+
+# ── Detect existing Mosquitto service (read-only, always runs) ───────────────
+
+- name: MQTT | Check for existing Mosquitto service
+  check_mode: false
+  ansible.windows.win_shell: |
+    $svc = Get-Service -Name 'mosquitto' -ErrorAction SilentlyContinue
+    if ($svc) {
+      "INSTALLED  Status=$($svc.Status)"
+    } else {
+      "NOT_INSTALLED"
+    }
+  register: mosquitto_existing
+  changed_when: false
+
+- name: MQTT | Report existing Mosquitto state
+  ansible.builtin.debug:
+    msg: "Existing Mosquitto: {{ mosquitto_existing.stdout | trim }}"
+
+# ── Branch: Mosquitto already present ────────────────────────────────────────
+#
+# BUG FIXED: previously used "'INSTALLED' in mosquitto_existing.stdout"
+# That is a substring test and fires on "NOT_INSTALLED" because it contains
+# the word "INSTALLED".  The correct test uses Jinja2 match(), which anchors
+# at the START of the string (equivalent to Python re.match):
+#
+#   WRONG : "'INSTALLED' in mosquitto_existing.stdout"
+#   CORRECT: "mosquitto_existing.stdout | trim | upper != 'NOT_INSTALLED'"
+#
+# "NOT_INSTALLED" does NOT match /^INSTALLED/ → condition is False → no abort.
+# "INSTALLED  Status=Running" DOES match /^INSTALLED/ → condition is True → safety check runs.
+
+- name: MQTT | Existing broker detected — safety check
+  ansible.builtin.fail:
+    msg: |
+      Mosquitto is already installed on this server ({{ mosquitto_existing.stdout | trim }}).
+      Storm Energy MQTT cannot share an existing broker without explicit configuration review.
+
+      REQUIRED ACTIONS before re-running deploy.yml:
+        1. Run discover.yml and review port 1883 and Mosquitto configuration.
+        2. Decide: share the existing broker (add Storm credentials to its passwd file),
+           OR run Mosquitto on a different port for Storm.
+        3. Set the resolved MQTT host/port in group_vars/all.yml:
+             scanvix_mqtt_host: '127.0.0.1'
+             scanvix_mqtt_port: 1883   # or alternate port
+        4. Set scanvix_mqtt_skip_install: true in group_vars/all.yml to skip this check.
+
+      Do NOT run this role again until the MQTT architecture is decided.
+  when:
+    - mosquitto_existing.stdout | trim | upper != "NOT_INSTALLED"
+    - not (scanvix_mqtt_skip_install | default(false) | bool)
+
+- name: MQTT | Existing broker — using as-is (skip_install confirmed)
+  ansible.builtin.debug:
+    msg:
+      - "Existing Mosquitto detected. Using existing broker."
+      - "Host: {{ scanvix_mqtt_host | default('127.0.0.1') }}  Port: {{ scanvix_mqtt_port | default(1883) }}"
+      - "Service: {{ scanvix_mqtt_service_name | default('mosquitto') }}"
+      - "NOTE: MQTT authentication (password_file) is a Gate 2 requirement — not configured at Gate 1."
+  when:
+    - mosquitto_existing.stdout | trim | upper != "NOT_INSTALLED"
+    - scanvix_mqtt_skip_install | default(false) | bool
+
+# ── Stage: ensure installer directory + copy from controller if available ────
+# Create the mqtt-installer directory on the target (idempotent win_file).
+# Then, if the controller has a Mosquitto installer at scanvix_mqtt_installer_source,
+# copy it to the target BEFORE the detection task runs, so detection finds it.
+# This is the same pattern used by the database role (win_copy src: playbook_dir/../../../).
+
+- name: MQTT | Ensure mqtt-installer directory exists on target
+  ansible.windows.win_file:
+    path: 'E:\StormEnergyRTU\scripts\mqtt-installer'
+    state: directory
+  when: "'NOT_INSTALLED' in mosquitto_existing.stdout"
+
+- name: MQTT | Check controller for Mosquitto installer
+  ansible.builtin.stat:
+    path: "{{ scanvix_mqtt_installer_source | default('') }}"
+  delegate_to: localhost
+  register: mqtt_ctrl_installer
+  when:
+    - "'NOT_INSTALLED' in mosquitto_existing.stdout"
+    - (scanvix_mqtt_installer_source | default('')) | length > 0
+
+- name: MQTT | CHECK MODE | Controller installer status
+  ansible.builtin.debug:
+    msg:
+      - "CHECK MODE: Controller installer path: {{ scanvix_mqtt_installer_source | default('(not configured)') }}"
+      - "Controller installer exists: {{ mqtt_ctrl_installer.stat.exists | default(false) }}"
+      - "{{ 'Would copy installer to E:\\StormEnergyRTU\\scripts\\mqtt-installer\\mosquitto-install.exe on real run.' if (mqtt_ctrl_installer.stat.exists | default(false)) else 'No controller installer found — ensure file is staged manually or place it at the configured path.' }}"
+  when:
+    - ansible_check_mode
+    - "'NOT_INSTALLED' in mosquitto_existing.stdout"
+
+- name: MQTT | Copy Mosquitto installer from controller to target
+  ansible.windows.win_copy:
+    src: "{{ scanvix_mqtt_installer_source }}"
+    dest: 'E:\StormEnergyRTU\scripts\mqtt-installer\mosquitto-install.exe'
+    force: false
+  when:
+    - not ansible_check_mode
+    - "'NOT_INSTALLED' in mosquitto_existing.stdout"
+    - mqtt_ctrl_installer is not skipped
+    - mqtt_ctrl_installer.stat.exists | default(false)
+
+# ── Branch: Mosquitto not present — detect WinRM-compatible installer ─────────
+# Tiered strategy (priority order):
+#   Priority 1: Pre-staged NSIS installer at E:\StormEnergyRTU\scripts\mqtt-installer\
+#               mosquitto-install.exe  — silent /S flag, Start-Process -Wait -PassThru
+#   Priority 2: Chocolatey (choco.exe) — ONLY if 'mosquitto' package confirmed in feed
+#               (community.chocolatey.org does NOT carry mosquitto; Choco is skipped
+#               when the package is absent even if choco.exe itself is executable)
+#   Priority 3: winget — non-AppX, execution-verified (&winget --version succeeds)
+#               AppX/WindowsApps winget is NOT usable from WinRM (Access Denied).
+# Detection is read-only (check_mode: false) and runs in both real and check mode.
+
+- name: MQTT | Detect WinRM-compatible installer for Mosquitto
+  check_mode: false
+  ansible.windows.win_shell: |
+    # ---- Priority 1: Pre-staged Mosquitto installer ----
+    # Checked first — Chocolatey community repo does not carry mosquitto.
+    $mqDir  = 'E:\StormEnergyRTU\scripts\mqtt-installer'
+    $staged = @('E:\StormEnergyRTU\scripts\mqtt-installer\mosquitto-install.exe')
+    if (Test-Path $mqDir) {
+      $glob = Get-ChildItem $mqDir -Filter 'mosquitto-*install*.exe' -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+      if ($glob) { $staged += $glob.FullName }
+    }
+    $foundStaged = $null
+    foreach ($s in $staged) {
+      if (Test-Path $s) { $foundStaged = $s; break }
+    }
+    if ($foundStaged) {
+      Write-Output "STAGED_STATUS:FOUND:$foundStaged"
+      Write-Output "CHOCO_STATUS:SKIPPED (staged installer takes priority)"
+      Write-Output "WINGET_STATUS:SKIPPED (staged installer takes priority)"
+      Write-Output "INSTALLER:STAGED"
+      Write-Output "INSTALLER_EXE:$foundStaged"
+      exit 0
+    }
+    Write-Output "STAGED_STATUS:NOT_FOUND"
+
+    # ---- Priority 2: Chocolatey — only if mosquitto package is available ----
+    $choco = Get-Command choco.exe -ErrorAction SilentlyContinue
+    if ($choco) {
+      $chocoExe = $choco.Source
+      $ver = & $chocoExe --version 2>&1
+      if ($LASTEXITCODE -eq 0) {
+        Write-Output "CHOCO_STATUS:FOUND"
+        # Verify the mosquitto package is actually in the feed before selecting it.
+        # 'choco search mosquitto --exact --limit-output' exits 0 and returns a line
+        # like "mosquitto|<version>" when the package exists, or returns no output
+        # (and still exits 0) when it does not.
+        $pkgSearch = & $chocoExe search mosquitto --exact --limit-output 2>&1
+        $pkgFound  = ($pkgSearch | Where-Object { $_ -match '^mosquitto\|' }).Count -gt 0
+        if ($pkgFound) {
+          Write-Output "CHOCO_MOSQUITTO_PACKAGE:FOUND"
+          Write-Output "INSTALLER:CHOCO"
+          Write-Output "INSTALLER_EXE:$chocoExe"
+          Write-Output "INSTALLER_VER:$($ver -join ' ')"
+          exit 0
+        } else {
+          Write-Output "CHOCO_MOSQUITTO_PACKAGE:NOT_FOUND (community repo does not carry mosquitto)"
+        }
+      } else {
+        Write-Output "CHOCO_STATUS:FOUND_BUT_NOT_EXECUTABLE"
+      }
+    } else {
+      Write-Output "CHOCO_STATUS:NOT_FOUND"
+    }
+
+    # ---- Priority 3: winget — test actual execution, AppX distinguished ----
+    $wgCmd = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if (-not $wgCmd) {
+      Write-Output "WINGET_STATUS:NOT_FOUND"
+      Write-Output "INSTALLER:NONE"
+      exit 0
+    }
+    $wgPath = $wgCmd.Source
+    $isAppX = ($wgPath -like '*WindowsApps*') -or ($wgPath -like '*AppData*Microsoft*WindowsApps*')
+    $testOut = & $wgPath --version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      if ($isAppX) {
+        Write-Output "WINGET_STATUS:FOUND_BUT_NOT_WINRM_EXECUTABLE (AppX/WindowsApps — Access Denied from WinRM)"
+      } else {
+        Write-Output "WINGET_STATUS:EXEC_FAILED"
+      }
+      Write-Output "INSTALLER:NONE"
+      exit 0
+    }
+    if ($isAppX) {
+      Write-Output "WINGET_STATUS:APPX_EXECUTABLE:$wgPath"
+    } else {
+      Write-Output "WINGET_STATUS:EXECUTABLE:$wgPath"
+    }
+    Write-Output "INSTALLER:WINGET"
+    Write-Output "INSTALLER_EXE:$wgPath"
+    Write-Output "INSTALLER_VER:$($testOut -join ' ')"
+    exit 0
+  register: mqtt_installer_detect
+  changed_when: false
+  failed_when: false
+  when: "'NOT_INSTALLED' in mosquitto_existing.stdout"
+
+- name: MQTT | Installer detection report
+  ansible.builtin.debug:
+    msg: "{{ mqtt_installer_detect.stdout_lines | default(['(installer detection skipped — Mosquitto already present)']) }}"
+
+- name: MQTT | FAIL -- no WinRM-compatible Mosquitto installer found
+  ansible.builtin.fail:
+    msg:
+      - "Mosquitto is not installed and no WinRM-compatible installer is available."
+      - ""
+      - "Detected:"
+      - "  Pre-staged installer: {{ (mqtt_installer_detect.stdout_lines | default([]) | select('match', 'STAGED_STATUS:') | list | first | default('STAGED_STATUS:NOT_FOUND')) | regex_replace('^STAGED_STATUS:', '') }}"
+      - "  Chocolatey:           {{ (mqtt_installer_detect.stdout_lines | default([]) | select('match', 'CHOCO_STATUS:') | list | first | default('CHOCO_STATUS:NOT_FOUND')) | regex_replace('^CHOCO_STATUS:', '') }}"
+      - "  Choco mosquitto pkg:  {{ (mqtt_installer_detect.stdout_lines | default([]) | select('match', 'CHOCO_MOSQUITTO_PACKAGE:') | list | first | default('CHOCO_MOSQUITTO_PACKAGE:NOT_CHECKED')) | regex_replace('^CHOCO_MOSQUITTO_PACKAGE:', '') }}"
+      - "  winget:               {{ (mqtt_installer_detect.stdout_lines | default([]) | select('match', 'WINGET_STATUS:') | list | first | default('WINGET_STATUS:NOT_FOUND')) | regex_replace('^WINGET_STATUS:', '') }}"
+      - ""
+      - "RECOMMENDED ACTION — stage the official Mosquitto installer (fastest path):"
+      - "  1. Download the official Windows x64 installer:"
+      - "       https://mosquitto.org/download/"
+      - '  2. Copy it to .109 at: E:\StormEnergyRTU\scripts\mqtt-installer\mosquitto-install.exe'
+      - "  3. Re-run Gate 1 — it will install silently using /S (NSIS silent flag)."
+      - ""
+      - "ALTERNATIVE — use winget if executable from WinRM:"
+      - "  Verify that winget is accessible under the WinRM service account and"
+      - "  that '& winget --version' exits 0. Re-run Gate 1."
+      - ""
+      - "NOTE: Chocolatey is present but does NOT carry the mosquitto package in its"
+      - "  community feed. Chocolatey is therefore not a viable install path."
+      - ""
+      - "Do NOT install Mosquitto by modifying WindowsApps permissions."
+      - 'Do NOT modify C:\Program Files\WindowsApps.'
+  when:
+    - "'NOT_INSTALLED' in mosquitto_existing.stdout"
+    - mqtt_installer_detect is not skipped
+    - "'INSTALLER:NONE' in mqtt_installer_detect.stdout"
+
+- name: MQTT | Store installer facts
+  ansible.builtin.set_fact:
+    _scanvix_mqtt_installer_method: >-
+      {{ mqtt_installer_detect.stdout_lines
+         | select('match', 'INSTALLER:')
+         | reject('match', 'INSTALLER_EXE:')
+         | reject('match', 'INSTALLER_VER:')
+         | first
+         | regex_replace('^INSTALLER:', '') }}
+    _scanvix_mqtt_installer_exe: >-
+      {{ mqtt_installer_detect.stdout_lines
+         | select('match', 'INSTALLER_EXE:')
+         | first
+         | regex_replace('^INSTALLER_EXE:', '') }}
+  when:
+    - "'NOT_INSTALLED' in mosquitto_existing.stdout"
+    - mqtt_installer_detect is not skipped
+    - "'INSTALLER:NONE' not in mqtt_installer_detect.stdout"
+
+- name: MQTT | CHECK MODE | Mosquitto absent — would install during real run
+  ansible.builtin.debug:
+    msg:
+      - "CHECK MODE: Mosquitto service not found on this server."
+      - "Detected installer method: {{ _scanvix_mqtt_installer_method | default('none') }}"
+      - "Installer path:            {{ _scanvix_mqtt_installer_exe | default('none') }}"
+      - "A real run will install Mosquitto, deploy mosquitto_storm.conf, and register the service."
+      - "Skipping installation tasks in check mode."
+  when:
+    - ansible_check_mode
+    - "'NOT_INSTALLED' in mosquitto_existing.stdout"
+    - mqtt_installer_detect is not skipped
+    - "'INSTALLER:NONE' not in (mqtt_installer_detect.stdout | default(''))"
+
+# ── Install tasks — all skip in --check mode ──────────────────────────────────
+
+- name: MQTT | Install Mosquitto via Chocolatey
+  ansible.windows.win_shell: |
+    Write-Output "Installing Mosquitto via Chocolatey: {{ _scanvix_mqtt_installer_exe }}"
+    & '{{ _scanvix_mqtt_installer_exe }}' install mosquitto -y --no-progress --limitoutput
+    if ($LASTEXITCODE -ne 0) {
+      Write-Error "choco install mosquitto failed (exit $LASTEXITCODE)"
+      exit 1
+    }
+    Write-Output "Mosquitto installed via Chocolatey"
+  register: mqtt_install_choco
+  changed_when: true
+  when:
+    - "'NOT_INSTALLED' in mosquitto_existing.stdout"
+    - not ansible_check_mode
+    - _scanvix_mqtt_installer_method is defined
+    - _scanvix_mqtt_installer_method == 'CHOCO'
+
+- name: MQTT | Install Mosquitto via pre-staged installer (NSIS silent)
+  ansible.windows.win_shell: |
+    $installer = '{{ _scanvix_mqtt_installer_exe }}'
+    Write-Output "MQTT_INSTALLER: $installer"
+    $proc = Start-Process `
+        -FilePath    $installer `
+        -ArgumentList '/S' `
+        -Wait `
+        -PassThru `
+        -WindowStyle Hidden
+    $exitCode = $proc.ExitCode
+    Write-Output "MQTT_INSTALL_EXIT_CODE: $exitCode"
+    if ($exitCode -eq 0) {
+      Write-Output "Mosquitto installed successfully (exit 0)."
+    } else {
+      Write-Error "Mosquitto installer FAILED. Installer=$installer | ExitCode=$exitCode"
+      exit 1
+    }
+  register: mqtt_install_staged
+  changed_when: true
+  when:
+    - "'NOT_INSTALLED' in mosquitto_existing.stdout"
+    - not ansible_check_mode
+    - _scanvix_mqtt_installer_method is defined
+    - _scanvix_mqtt_installer_method == 'STAGED'
+
+- name: MQTT | Install Mosquitto via winget (non-AppX, execution-verified)
+  ansible.windows.win_shell: |
+    Write-Output "Installing Mosquitto via winget: {{ _scanvix_mqtt_installer_exe }}"
+    & '{{ _scanvix_mqtt_installer_exe }}' install `
+        --id EclipseFoundation.Mosquitto `
+        --silent `
+        --accept-package-agreements `
+        --accept-source-agreements
+    if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
+      Write-Error "winget install EclipseFoundation.Mosquitto failed (exit $LASTEXITCODE)"
+      exit 1
+    }
+    Write-Output "Mosquitto installed via winget"
+  register: mqtt_install_winget
+  changed_when: true
+  when:
+    - "'NOT_INSTALLED' in mosquitto_existing.stdout"
+    - not ansible_check_mode
+    - _scanvix_mqtt_installer_method is defined
+    - _scanvix_mqtt_installer_method == 'WINGET'
+
+- name: MQTT | Deploy Storm-dedicated mosquitto.conf
+  ansible.windows.win_template:
+    src: mosquitto.conf.j2
+    dest: 'C:\Program Files\mosquitto\mosquitto_storm.conf'
+  when:
+    - "'NOT_INSTALLED' in mosquitto_existing.stdout"
+    - not ansible_check_mode
+
+- name: MQTT | Register Mosquitto as Windows service with Storm config
+  ansible.windows.win_shell: |
+    $svc = Get-Service -Name 'mosquitto' -ErrorAction SilentlyContinue
+    if (-not $svc) {
+      & 'C:\Program Files\mosquitto\mosquitto.exe' install
+      sc.exe config mosquitto binpath= '"C:\Program Files\mosquitto\mosquitto.exe" -c "C:\Program Files\mosquitto\mosquitto_storm.conf"'
+      "Mosquitto service registered"
+    } else {
+      "Mosquitto service already registered — skipping"
+    }
+  register: mosquitto_svc_reg
+  changed_when: "'registered' in mosquitto_svc_reg.stdout"
+  when:
+    - "'NOT_INSTALLED' in mosquitto_existing.stdout"
+    - not ansible_check_mode
+
+- name: MQTT | Start and enable Mosquitto service
+  ansible.windows.win_service:
+    name: mosquitto
+    state: started
+    start_mode: auto
+  when:
+    - "'NOT_INSTALLED' in mosquitto_existing.stdout"
+    - not ansible_check_mode

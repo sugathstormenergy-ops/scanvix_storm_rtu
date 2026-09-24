@@ -1,0 +1,20 @@
+---
+- import_tasks: discovery.yml
+  tags: [always, discovery]
+- import_tasks: backup.yml
+  tags: [backup]
+- import_tasks: deploy.yml
+  tags: [deploy]
+- name: "Register router + validate (auto-rollback on failure)"
+  block:
+    - import_tasks: register_router.yml
+    - import_tasks: validate.yml
+  rescue:
+    - import_tasks: rollback.yml
+  tags: [register, validate]
+- import_tasks: restart.yml
+  tags: [restart]
+- import_tasks: verify.yml
+  tags: [verify]
+- import_tasks: report.yml
+  tags: [always, report]

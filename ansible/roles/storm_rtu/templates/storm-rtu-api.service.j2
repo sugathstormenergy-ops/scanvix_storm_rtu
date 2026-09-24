@@ -1,0 +1,32 @@
+[Unit]
+Description=Storm Energy RTU Platform — API + MQTT + TCP
+Documentation=https://github.com/storm-energy/storm-energy-rtu
+After=network.target mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=exec
+User={{ app_user }}
+Group={{ app_group }}
+WorkingDirectory={{ app_base_dir }}/backend
+EnvironmentFile={{ app_base_dir }}/backend/.env
+ExecStart={{ app_base_dir }}/venv/bin/uvicorn app.main:app \
+    --host ${API_HOST} \
+    --port ${API_PORT} \
+    --log-level info \
+    --no-access-log
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=storm-rtu-api
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths={{ app_log_dir }}
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

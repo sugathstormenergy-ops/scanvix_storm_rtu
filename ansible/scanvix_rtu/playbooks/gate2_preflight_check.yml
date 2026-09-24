@@ -1,0 +1,383 @@
+---
+# ============================================================================
+# Storm Energy RTU — Gate 2 Pre-flight Check
+# ============================================================================
+# READ-ONLY: No configuration changes are made.
+# Verifies all conditions required before gate2.yml can succeed.
+#
+# Checks performed:
+#   GATE1 prereqs (G1-01..G1-05): Install dir, venv, DB, mosquitto.exe, NSSM
+#   Storm port conflicts (G1-06..G1-07): 8090 / 9000 must be free or owned by Storm
+#   Allipuram safety (CHK1..CHK2): GoReceiver Running, port 8088 LISTENING
+#   MQTT readiness (CHK3..CHK9): native service, StormMosquitto, binary,
+#                                 config, config test, port 1883
+#
+# Usage:
+#   ANSIBLE_CONFIG=ansible.cfg ansible-playbook \
+#     -i inventory/hosts.ini playbooks/gate2_preflight_check.yml
+# ============================================================================
+
+- name: Storm Energy RTU — Gate 2 Pre-flight Check (read-only)
+  hosts: scanvix_rtu
+  gather_facts: false
+
+  vars:
+    preflight_pass: true   # overridden to false on any failure
+
+  tasks:
+
+    # ── GATE 1 PREREQS ───────────────────────────────────────────────────────
+
+    - name: G1-01 | Install directory exists
+      ansible.windows.win_shell: |
+        $d = '{{ scanvix_install_dir }}'
+        if (Test-Path $d) { Write-Output "PASS: $d exists" }
+        else              { Write-Output "FAIL: $d NOT FOUND" }
+      register: chk_installdir
+      changed_when: false
+
+    - name: G1-01 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_installdir.stdout | trim }}"
+
+    - name: G1-02 | Venv python reachable
+      ansible.windows.win_shell: |
+        $py = '{{ scanvix_venv_dir }}\Scripts\python.exe'
+        if (Test-Path $py) {
+          $v = (& $py --version 2>&1)
+          Write-Output "PASS: venv python found — $v"
+        } else {
+          Write-Output "FAIL: venv python not found at $py"
+        }
+      register: chk_venv
+      changed_when: false
+
+    - name: G1-02 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_venv.stdout | trim }}"
+
+    - name: G1-03 | STORM_ENERGY_RTU database exists
+      ansible.windows.win_shell: |
+        try {
+          $cs  = "Server={{ scanvix_sql_server }};Database=master;Integrated Security=True;TrustServerCertificate=True"
+          $con = New-Object System.Data.SqlClient.SqlConnection($cs)
+          $con.Open()
+          $cmd = $con.CreateCommand()
+          $cmd.CommandText = "SELECT name FROM sys.databases WHERE name='STORM_ENERGY_RTU'"
+          $r = $cmd.ExecuteReader()
+          if ($r.Read()) {
+            Write-Output "PASS: STORM_ENERGY_RTU database found on {{ scanvix_sql_server }}"
+          } else {
+            Write-Output "FAIL: STORM_ENERGY_RTU database NOT FOUND on {{ scanvix_sql_server }}"
+          }
+          $r.Close(); $con.Close()
+        } catch {
+          Write-Output "FAIL: SQL connection error — $_"
+        }
+      register: chk_db
+      changed_when: false
+
+    - name: G1-03 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_db.stdout | trim }}"
+
+    - name: G1-03B | All 8 required dbo tables exist
+      ansible.windows.win_shell: |
+        try {
+          $cs  = "Server={{ scanvix_sql_server }};Database=STORM_ENERGY_RTU;Integrated Security=True;TrustServerCertificate=True"
+          $con = New-Object System.Data.SqlClient.SqlConnection($cs)
+          $con.Open()
+          $cmd = $con.CreateCommand()
+          $cmd.CommandText = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME IN ('Devices','DeviceConfiguration','Telemetry','RawMessages','MQTTMessages','TCPMessages','DeviceCommands','DeviceEvents')"
+          $reader = $cmd.ExecuteReader()
+          $present = @()
+          while ($reader.Read()) { $present += $reader.GetString(0) }
+          $con.Close()
+          $required = @('Devices','DeviceConfiguration','Telemetry','RawMessages','MQTTMessages','TCPMessages','DeviceCommands','DeviceEvents')
+          $missing = $required | Where-Object { $present -notcontains $_ }
+          if ($missing.Count -eq 0) {
+            Write-Output "PASS: all 8 required tables present ($($present -join ', '))"
+          } else {
+            Write-Output "FAIL: $($missing.Count) required table(s) missing: $($missing -join ', ')"
+          }
+        } catch {
+          Write-Output "FAIL: SQL connection error — $_"
+        }
+      register: chk_tables
+      changed_when: false
+
+    - name: G1-03B | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_tables.stdout | trim }}"
+
+    - name: G1-04 | mosquitto.exe present
+      ansible.windows.win_shell: |
+        $exe = '{{ scanvix_mosquitto_exe }}'
+        if (Test-Path $exe) {
+          $v = (& $exe --version 2>&1 | Select-Object -First 2) -join ' '
+          Write-Output "PASS: mosquitto.exe found — $v"
+        } else {
+          Write-Output "FAIL: mosquitto.exe NOT FOUND at $exe"
+        }
+      register: chk_mqttexe
+      changed_when: false
+
+    - name: G1-04 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_mqttexe.stdout | trim }}"
+
+    - name: G1-05 | NSSM present
+      ansible.windows.win_shell: |
+        $n = '{{ scanvix_nssm_exe }}'
+        if (Test-Path $n) {
+          $v = (& $n version 2>&1) -join ' '
+          Write-Output "PASS: NSSM found — $v"
+        } else {
+          Write-Output "FAIL: NSSM NOT FOUND at $n"
+        }
+      register: chk_nssm
+      changed_when: false
+
+    - name: G1-05 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_nssm.stdout | trim }}"
+
+    # ── STORM PORT CONFLICT CHECKS ───────────────────────────────────────────
+
+    - name: G1-06 | Port 8090 (API) — must be free or owned by Storm
+      ansible.windows.win_shell: |
+        $conns = Get-NetTCPConnection -LocalPort {{ scanvix_api_port }} -State Listen -ErrorAction SilentlyContinue
+        if (-not $conns) {
+          Write-Output "PASS: port {{ scanvix_api_port }} free (StormEnergyRTU-API not yet started)"
+        } else {
+          $pid = ($conns | Select-Object -First 1).OwningProcess
+          $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+          $name = if ($proc) { $proc.Name } else { "pid $pid" }
+          if ($name -match 'uvicorn|python|powershell') {
+            Write-Output "INFO: port {{ scanvix_api_port }} already in use by Storm-compatible process ($name pid=$pid) — will be reused"
+          } else {
+            Write-Output "FAIL: port {{ scanvix_api_port }} in use by FOREIGN process ($name pid=$pid) — must be released before Gate 2"
+          }
+        }
+      register: chk_port8090
+      changed_when: false
+
+    - name: G1-06 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_port8090.stdout | trim }}"
+
+    - name: G1-07 | Port 9000 (TCP) — must be free or owned by Storm
+      ansible.windows.win_shell: |
+        $conns = Get-NetTCPConnection -LocalPort {{ scanvix_tcp_port }} -State Listen -ErrorAction SilentlyContinue
+        if (-not $conns) {
+          Write-Output "PASS: port {{ scanvix_tcp_port }} free (TCPServer not yet started)"
+        } else {
+          $pid = ($conns | Select-Object -First 1).OwningProcess
+          $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+          $name = if ($proc) { $proc.Name } else { "pid $pid" }
+          if ($name -match 'uvicorn|python|powershell') {
+            Write-Output "INFO: port {{ scanvix_tcp_port }} already in use by Storm-compatible process ($name pid=$pid) — will be reused"
+          } else {
+            Write-Output "FAIL: port {{ scanvix_tcp_port }} in use by FOREIGN process ($name pid=$pid) — must be released before Gate 2"
+          }
+        }
+      register: chk_port9000
+      changed_when: false
+
+    - name: G1-07 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_port9000.stdout | trim }}"
+
+    # ── ALLIPURAM SAFETY ─────────────────────────────────────────────────────
+
+    - name: CHK1 | AllipuramPFCMD-Go-Receiver service state
+      ansible.windows.win_shell: |
+        $svc = Get-Service -Name 'AllipuramPFCMD-Go-Receiver' -ErrorAction SilentlyContinue
+        if (-not $svc) {
+          Write-Output "FAIL: AllipuramPFCMD-Go-Receiver service NOT FOUND"
+        } elseif ($svc.Status -eq 'Running') {
+          $proc = Get-Process pfcmd-receiver -ErrorAction SilentlyContinue
+          $pid  = if ($proc) { $proc.Id } else { "unknown" }
+          Write-Output "PASS: AllipuramPFCMD-Go-Receiver RUNNING (pfcmd-receiver.exe PID $pid)"
+        } else {
+          Write-Output "FAIL: AllipuramPFCMD-Go-Receiver is $($svc.Status) — must be RUNNING before Gate 2"
+        }
+      register: chk_receiver
+      changed_when: false
+
+    - name: CHK1 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_receiver.stdout | trim }}"
+
+    - name: CHK2 | Port 8088 LISTENING and owned by pfcmd-receiver.exe
+      ansible.windows.win_shell: |
+        $conn = Get-NetTCPConnection -LocalPort 8088 -State Listen -ErrorAction SilentlyContinue
+        if (-not $conn) {
+          Write-Output "FAIL: port 8088 NOT LISTENING"
+        } else {
+          $ownerPid = ($conn | Select-Object -First 1).OwningProcess
+          $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid"
+          $procName = if ($proc) { $proc.Name } else { "unknown" }
+          if ($procName -ieq "pfcmd-receiver.exe") {
+            Write-Output "PASS: port 8088 owned by pfcmd-receiver.exe (PID $ownerPid)"
+          } else {
+            Write-Output "FAIL: port 8088 LISTENING but owner is '$procName' (PID $ownerPid) -- expected pfcmd-receiver.exe"
+          }
+        }
+      register: chk_8088
+      changed_when: false
+
+    - name: CHK2 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_8088.stdout | trim }}"
+
+    # ── MQTT READINESS ───────────────────────────────────────────────────────
+
+    - name: CHK3 | Native mosquitto service state
+      ansible.windows.win_shell: |
+        $svc = Get-Service -Name '{{ scanvix_native_mqtt_service_name }}' -ErrorAction SilentlyContinue
+        if (-not $svc) {
+          Write-Output "INFO: native mosquitto service not found (may have already been removed)"
+        } elseif ($svc.StartType -eq 'Disabled') {
+          Write-Output "PASS: native mosquitto service is Disabled (will not compete for port 1883)"
+        } elseif ($svc.Status -eq 'Running') {
+          Write-Output "WARN: native mosquitto service is RUNNING — gate2.yml will stop + disable it"
+        } else {
+          Write-Output "INFO: native mosquitto service is $($svc.Status) / $($svc.StartType)"
+        }
+      register: chk_native
+      changed_when: false
+
+    - name: CHK3 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_native.stdout | trim }}"
+
+    - name: CHK4 | StormMosquitto service state
+      ansible.windows.win_shell: |
+        $svc = Get-Service -Name '{{ scanvix_storm_mqtt_service_name }}' -ErrorAction SilentlyContinue
+        if (-not $svc) {
+          Write-Output "INFO: StormMosquitto not yet registered (will be created by gate2.yml)"
+        } elseif ($svc.Status -eq 'Running') {
+          Write-Output "PASS: StormMosquitto already RUNNING"
+        } elseif ($svc.Status -eq 'Paused') {
+          Write-Output "FAIL: StormMosquitto is PAUSED — check NSSM AppParameters (must use -c, NOT run -c)"
+        } else {
+          Write-Output "INFO: StormMosquitto is $($svc.Status) (will be started by gate2.yml)"
+        }
+      register: chk_storm_mqtt
+      changed_when: false
+
+    - name: CHK4 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_storm_mqtt.stdout | trim }}"
+
+    - name: CHK5 | NSSM binary at expected path (second check — for broker registration)
+      ansible.windows.win_shell: |
+        $n = '{{ scanvix_nssm_exe }}'
+        if (Test-Path $n) { Write-Output "PASS: NSSM at $n" }
+        else              { Write-Output "FAIL: NSSM NOT FOUND at $n" }
+      register: chk_nssm2
+      changed_when: false
+
+    - name: CHK5 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_nssm2.stdout | trim }}"
+
+    - name: CHK6 | mosquitto.exe reachable from expected location
+      ansible.windows.win_shell: |
+        $exe = '{{ scanvix_mosquitto_exe }}'
+        if (Test-Path $exe) { Write-Output "PASS: mosquitto.exe at $exe" }
+        else                { Write-Output "FAIL: mosquitto.exe NOT FOUND at $exe" }
+      register: chk_mqttbin
+      changed_when: false
+
+    - name: CHK6 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_mqttbin.stdout | trim }}"
+
+    - name: CHK7 | mosquitto_storm.conf present
+      ansible.windows.win_shell: |
+        $f = '{{ scanvix_mosquitto_conf }}'
+        if (Test-Path $f) { Write-Output "PASS: $f exists" }
+        else              { Write-Output "INFO: $f not yet deployed (gate2.yml will create it)" }
+      register: chk_conf
+      changed_when: false
+
+    - name: CHK7 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_conf.stdout | trim }}"
+
+    - name: CHK8 | mosquitto_storm.conf content directives (if present)
+      ansible.windows.win_shell: |
+        $f = '{{ scanvix_mosquitto_conf }}'
+        if (-not (Test-Path $f)) {
+          Write-Output "SKIP: config not deployed yet"
+        } else {
+          $c = Get-Content $f -Raw
+          $checks = @(
+            @{ name='listener 1883'; pat='listener\s+1883' },
+            @{ name='allow_anonymous false'; pat='allow_anonymous\s+false' },
+            @{ name='password_file'; pat='password_file' }
+          )
+          foreach ($chk in $checks) {
+            if ($c -match $chk.pat) { Write-Output "PASS: directive '$($chk.name)' found" }
+            else                    { Write-Output "FAIL: directive '$($chk.name)' MISSING" }
+          }
+        }
+      register: chk_directives
+      changed_when: false
+
+    - name: CHK8 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_directives.stdout_lines }}"
+
+    - name: CHK9 | Port 1883 — must be free or owned by StormMosquitto
+      ansible.windows.win_shell: |
+        $conn = Get-NetTCPConnection -LocalPort 1883 -State Listen -ErrorAction SilentlyContinue
+        if (-not $conn) {
+          Write-Output "PASS: port 1883 free (StormMosquitto not yet started)"
+        } else {
+          $pid  = ($conn | Select-Object -First 1).OwningProcess
+          $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+          $name = if ($proc) { $proc.Name } else { "pid $pid" }
+          if ($name -eq 'mosquitto') {
+            Write-Output "PASS: port 1883 in use by mosquitto.exe (pid $pid) — likely StormMosquitto already running"
+          } else {
+            Write-Output "FAIL: port 1883 in use by FOREIGN process '$name' (pid $pid)"
+          }
+        }
+      register: chk_port1883
+      changed_when: false
+
+    - name: CHK9 | Result
+      ansible.builtin.debug:
+        msg: "{{ chk_port1883.stdout | trim }}"
+
+    # ── PREFLIGHT SUMMARY ────────────────────────────────────────────────────
+
+    - name: PREFLIGHT SUMMARY
+      ansible.builtin.debug:
+        msg: |
+          ╔═══════════════════════════════════════════════════════════════╗
+          ║          Storm Energy RTU — Gate 2 Pre-flight Results         ║
+          ╠═══════════════════════════════════════════════════════════════╣
+          ║  G1-01 Install dir    : {{ chk_installdir.stdout | trim | truncate(45) }}
+          ║  G1-02 Venv python    : {{ chk_venv.stdout | trim | truncate(45) }}
+          ║  G1-03 DB exists      : {{ chk_db.stdout | trim | truncate(45) }}
+          ║  G1-03B DB tables     : {{ chk_tables.stdout | trim | truncate(45) }}
+          ║  G1-04 mosquitto.exe  : {{ chk_mqttexe.stdout | trim | truncate(45) }}
+          ║  G1-05 NSSM binary    : {{ chk_nssm.stdout | trim | truncate(45) }}
+          ║  G1-06 Port 8090      : {{ chk_port8090.stdout | trim | truncate(45) }}
+          ║  G1-07 Port 9000      : {{ chk_port9000.stdout | trim | truncate(45) }}
+          ║  CHK1  GoReceiver     : {{ chk_receiver.stdout | trim | truncate(45) }}
+          ║  CHK2  Port 8088      : {{ chk_8088.stdout | trim | truncate(45) }}
+          ║  CHK3  Native MQTT    : {{ chk_native.stdout | trim | truncate(45) }}
+          ║  CHK4  StormMosquitto : {{ chk_storm_mqtt.stdout | trim | truncate(45) }}
+          ║  CHK6  mosquitto.exe  : {{ chk_mqttbin.stdout | trim | truncate(45) }}
+          ║  CHK7  storm.conf     : {{ chk_conf.stdout | trim | truncate(45) }}
+          ║  CHK9  Port 1883      : {{ chk_port1883.stdout | trim | truncate(45) }}
+          ╠═══════════════════════════════════════════════════════════════╣
+          ║  ACTION: Review any FAIL/WARN lines above before running      ║
+          ║          gate2.yml. INFO lines indicate first-run conditions  ║
+          ║          that gate2.yml will configure automatically.         ║
+          ╚═══════════════════════════════════════════════════════════════╝

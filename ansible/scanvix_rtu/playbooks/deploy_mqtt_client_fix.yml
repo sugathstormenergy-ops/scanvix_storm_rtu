@@ -1,0 +1,139 @@
+---
+# Storm Energy RTU — Deploy MQTT reconnect/resubscribe fix ONLY
+#
+# Touches ONLY:
+#   backend/app/mqtt/client.py
+#
+# Restarts ONLY:
+#   StormEnergyRTU-API
+#
+# Does NOT touch:
+#   Mosquitto
+#   Allipuram/PFCMD receiver
+#   database/schema
+#   firewall
+#   IIS
+#   port 8088
+
+- name: Storm Energy RTU — Deploy MQTT client reconnect fix
+  hosts: scanvix_rtu
+  gather_facts: false
+
+  vars:
+    mqtt_client_file: app/mqtt/client.py
+
+  tasks:
+
+    - name: MQTT FIX | Verify source file exists
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../../backend/{{ mqtt_client_file }}"
+      delegate_to: localhost
+      register: source_file
+
+    - name: MQTT FIX | Abort if source file is missing
+      ansible.builtin.assert:
+        that:
+          - source_file.stat.exists
+        fail_msg: "Source file not found: backend/{{ mqtt_client_file }}"
+
+    - name: MQTT FIX | Create backup directory
+      ansible.windows.win_file:
+        path: "{{ scanvix_install_dir }}\\backups\\mqtt_client_fix"
+        state: directory
+
+    - name: MQTT FIX | Backup current production client.py
+      ansible.windows.win_shell: |
+        $src = '{{ scanvix_app_dir }}\{{ mqtt_client_file }}'
+        $dst = '{{ scanvix_install_dir }}\backups\mqtt_client_fix\client.py'
+
+        if (Test-Path $src) {
+          Copy-Item -Path $src -Destination $dst -Force
+          Write-Output "BACKUP_CREATED: $dst"
+        } else {
+          Write-Output "NO_EXISTING_FILE_TO_BACKUP"
+        }
+
+    - name: MQTT FIX | Copy fixed client.py
+      ansible.windows.win_copy:
+        src: "{{ playbook_dir }}/../../../backend/{{ mqtt_client_file }}"
+        dest: "{{ scanvix_app_dir }}\\{{ mqtt_client_file }}"
+
+    - name: MQTT FIX | Calculate controller SHA256
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../../backend/{{ mqtt_client_file }}"
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      register: controller_file
+
+    - name: MQTT FIX | Calculate remote SHA256
+      ansible.windows.win_shell: |
+        (Get-FileHash -Algorithm SHA256 -Path '{{ scanvix_app_dir }}\{{ mqtt_client_file }}').Hash
+      register: remote_file
+      changed_when: false
+
+    - name: MQTT FIX | Verify deployed file integrity
+      ansible.builtin.assert:
+        that:
+          - controller_file.stat.checksum | upper == (remote_file.stdout | trim | upper)
+        fail_msg: >-
+          SHA256 mismatch for {{ mqtt_client_file }}.
+          Controller={{ controller_file.stat.checksum }}
+          Remote={{ remote_file.stdout | trim }}
+        success_msg: >-
+          SHA256 verified for {{ mqtt_client_file }}:
+          {{ controller_file.stat.checksum }}
+
+    - name: MQTT FIX | Restart ONLY StormEnergyRTU-API
+      ansible.windows.win_shell: |
+        Get-Service -Name '{{ scanvix_api_service_name }}' -ErrorAction Stop | Out-Null
+        Restart-Service -Name '{{ scanvix_api_service_name }}' -Force
+        Start-Sleep -Seconds 5
+        (Get-Service -Name '{{ scanvix_api_service_name }}').Status
+      register: restart_result
+      changed_when: true
+
+    - name: MQTT FIX | Verify API service is running
+      ansible.windows.win_shell: |
+        $s = Get-Service -Name '{{ scanvix_api_service_name }}' -ErrorAction Stop
+        if ($s.Status -ne 'Running') {
+          throw "API service is not running. Current status: $($s.Status)"
+        }
+        $s.Status
+      register: service_status
+      changed_when: false
+
+    - name: MQTT FIX | Verify API port 8090
+      ansible.windows.win_shell: |
+        (Test-NetConnection -ComputerName 127.0.0.1 -Port 8090).TcpTestSucceeded
+      register: api_port
+      changed_when: false
+
+    - name: MQTT FIX | Verify TCP port 9000
+      ansible.windows.win_shell: |
+        (Test-NetConnection -ComputerName 127.0.0.1 -Port {{ scanvix_tcp_port }}).TcpTestSucceeded
+      register: tcp_port
+      changed_when: false
+
+    - name: MQTT FIX | Verify legacy port 8088 remains untouched
+      ansible.windows.win_shell: |
+        $c = Get-NetTCPConnection -LocalPort 8088 -State Listen -ErrorAction SilentlyContinue
+        if ($c) {
+          "8088 STILL LISTENING - PID $($c.OwningProcess)"
+        } else {
+          "8088 NOT LISTENING - investigate"
+        }
+      register: legacy_port
+      changed_when: false
+
+    - name: MQTT FIX | Deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "MQTT client fix deployed"
+          - "File: {{ mqtt_client_file }}"
+          - "SHA256: {{ controller_file.stat.checksum }}"
+          - "API service: {{ service_status.stdout | trim }}"
+          - "API 8090: {{ api_port.stdout | trim }}"
+          - "TCP 9000: {{ tcp_port.stdout | trim }}"
+          - "Legacy 8088: {{ legacy_port.stdout | trim }}"
+          - "Mosquitto was NOT restarted"
+          - "Database was NOT modified"

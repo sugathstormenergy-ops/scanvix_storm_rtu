@@ -1,0 +1,21 @@
+# NOTE: TCP server runs inside the unified uvicorn process by default.
+# This service definition is for optional standalone TCP server deployment.
+[Unit]
+Description=Storm Energy RTU Platform — Standalone TCP Listener
+After=network.target
+
+[Service]
+Type=exec
+User={{ app_user }}
+Group={{ app_group }}
+WorkingDirectory={{ app_base_dir }}/backend
+EnvironmentFile={{ app_base_dir }}/backend/.env
+ExecStart={{ app_base_dir }}/venv/bin/python -m app.tcp.server
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=storm-rtu-tcp
+
+[Install]
+WantedBy=multi-user.target

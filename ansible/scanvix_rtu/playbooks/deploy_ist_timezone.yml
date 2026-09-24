@@ -1,0 +1,137 @@
+---
+# Storm Energy RTU — Deploy ONLY the already-tested IST timezone changes
+#
+# Source (controller):  backend/{listed files}
+# Destination (scanvix109): {{ scanvix_app_dir }}\{same relative path}
+#
+# Deploys ONLY these 10 already-tested files (42/42 tests passed, see IST
+# timezone audit report). No other source is touched, no audit re-runs,
+# no schema changes, no protocol changes.
+#
+#   app/timezone.py                (new)
+#   app/database/models.py
+#   app/database/repository.py
+#   app/mqtt/consumer.py
+#   app/services/device_service.py
+#   app/services/event_service.py
+#   app/protocol/telemetry.py
+#   app/tcp/server.py
+#   app/services/telemetry_service.py
+#   app/main.py
+#
+# Does NOT touch: Allipuram/PFCMD receiver, port 8088, Mosquitto, IIS,
+# firewall, database schema, historical rows, TCP/MQTT wire protocol.
+# Restarts ONLY StormEnergyRTU-API (never StormMosquitto / Allipuram / IIS).
+
+- name: Storm Energy RTU — Deploy IST timezone changes
+  hosts: scanvix_rtu
+  gather_facts: false
+
+  vars:
+    ist_files:
+      - app/timezone.py
+      - app/database/models.py
+      - app/database/repository.py
+      - app/mqtt/consumer.py
+      - app/services/device_service.py
+      - app/services/event_service.py
+      - app/protocol/telemetry.py
+      - app/tcp/server.py
+      - app/services/telemetry_service.py
+      - app/main.py
+
+  tasks:
+    - name: IST DEPLOY | Timestamp for backup folder
+      ansible.builtin.set_fact:
+        backup_stamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+      delegate_to: localhost
+
+    - name: IST DEPLOY | Create backup directory on remote host
+      ansible.windows.win_file:
+        path: '{{ scanvix_install_dir }}\backups\ist_deploy_{{ backup_stamp }}'
+        state: directory
+
+    - name: IST DEPLOY | Backup current live files before replacing
+      ansible.windows.win_shell: |
+        $src = '{{ scanvix_app_dir }}\{{ item }}'
+        $dstDir = '{{ scanvix_install_dir }}\backups\ist_deploy_{{ backup_stamp }}\{{ item | dirname }}'
+        if (Test-Path $src) {
+          New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+          Copy-Item -Path $src -Destination "$dstDir\{{ item | basename }}" -Force
+          Write-Output "BACKED_UP: {{ item }}"
+        } else {
+          Write-Output "NEW_FILE_NO_BACKUP_NEEDED: {{ item }}"
+        }
+      loop: '{{ ist_files }}'
+      register: backup_results
+      changed_when: true
+
+    - name: IST DEPLOY | Backup results
+      ansible.builtin.debug:
+        msg: "{{ backup_results.results | map(attribute='stdout') | list }}"
+
+    - name: IST DEPLOY | Copy tested files from controller to live app dir
+      ansible.windows.win_copy:
+        src: "{{ playbook_dir }}/../../../backend/{{ item }}"
+        dest: '{{ scanvix_app_dir }}\{{ item }}'
+      loop: '{{ ist_files }}'
+      register: copy_results
+
+    - name: IST DEPLOY | Verify deployed file hashes (integrity check)
+      ansible.windows.win_shell: |
+        (Get-FileHash -Algorithm SHA256 -Path '{{ scanvix_app_dir }}\{{ item }}').Hash
+      loop: '{{ ist_files }}'
+      register: remote_hashes
+      changed_when: false
+
+    - name: IST DEPLOY | Remote file hashes
+      ansible.builtin.debug:
+        msg: "{{ item.item }}: {{ item.stdout | trim }}"
+      loop: '{{ remote_hashes.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+
+    - name: IST DEPLOY | Restart ONLY StormEnergyRTU-API
+      ansible.windows.win_shell: |
+        Get-Service -Name '{{ scanvix_api_service_name }}' -ErrorAction Stop | Out-Null
+        Restart-Service -Name '{{ scanvix_api_service_name }}' -Force
+        Start-Sleep -Seconds 5
+        (Get-Service -Name '{{ scanvix_api_service_name }}').Status
+      register: restart_result
+      changed_when: true
+
+    - name: IST DEPLOY | Service status after restart
+      ansible.builtin.debug:
+        msg: "{{ scanvix_api_service_name }}: {{ restart_result.stdout | trim }}"
+
+    - name: IST DEPLOY | Confirm TCP port 9000 is listening
+      ansible.windows.win_shell: |
+        (Test-NetConnection -ComputerName 127.0.0.1 -Port {{ scanvix_tcp_port }}).TcpTestSucceeded
+      register: port_check
+      changed_when: false
+
+    - name: IST DEPLOY | Port 9000 listening?
+      ansible.builtin.debug:
+        msg: "Port {{ scanvix_tcp_port }} TcpTestSucceeded: {{ port_check.stdout | trim }}"
+
+    - name: IST DEPLOY | Confirm port 8088 (Allipuram) untouched — read-only
+      ansible.windows.win_shell: |
+        $c = Get-NetTCPConnection -LocalPort 8088 -State Listen -ErrorAction SilentlyContinue
+        if ($c) { "8088 still LISTENING, owned by PID $($c.OwningProcess)" } else { "8088 NOT LISTENING (unexpected -- investigate before proceeding)" }
+      register: port8088_check
+      changed_when: false
+
+    - name: IST DEPLOY | Port 8088 status (Allipuram — must be unaffected)
+      ansible.builtin.debug:
+        msg: "{{ port8088_check.stdout | trim }}"
+
+    - name: IST DEPLOY | Confirm service is configured to run from the deployed app dir
+      ansible.windows.win_shell: |
+        $n = '{{ scanvix_nssm_exe }}'
+        (& $n get '{{ scanvix_api_service_name }}' AppDirectory 2>&1) -join ''
+      register: app_dir_check
+      changed_when: false
+
+    - name: IST DEPLOY | Live AppDirectory (must equal scanvix_app_dir)
+      ansible.builtin.debug:
+        msg: "Configured AppDirectory: {{ app_dir_check.stdout | trim }}  (expected: {{ scanvix_app_dir }})"

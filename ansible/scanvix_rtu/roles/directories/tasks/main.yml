@@ -1,0 +1,91 @@
+---
+# Storm Energy RTU -- Directories Role
+# Creates the Storm directory tree on E: drive.
+# Idempotent: win_file with state=directory is a no-op if already present.
+# NEVER touches any Allipuram or PFCMD directories.
+
+# -- Tasks 1-5: create directories (mutation, check-mode aware) ---------------
+
+- name: DIRECTORIES | Create E:\StormEnergyRTU (root)
+  ansible.windows.win_file:
+    path: 'E:\StormEnergyRTU'
+    state: directory
+
+- name: DIRECTORIES | Create E:\StormEnergyRTU\app
+  ansible.windows.win_file:
+    path: '{{ scanvix_app_dir }}'
+    state: directory
+
+- name: DIRECTORIES | Create E:\StormEnergyRTU\config
+  ansible.windows.win_file:
+    path: '{{ scanvix_config_dir }}'
+    state: directory
+
+- name: DIRECTORIES | Create E:\StormEnergyRTU\logs
+  ansible.windows.win_file:
+    path: '{{ scanvix_logs_dir }}'
+    state: directory
+
+- name: DIRECTORIES | Create E:\StormEnergyRTU\scripts
+  ansible.windows.win_file:
+    path: '{{ scanvix_scripts_dir }}'
+    state: directory
+
+- name: DIRECTORIES | Create E:\StormEnergyRTU\certs (MQTT TLS material -- not populated by this role)
+  ansible.windows.win_file:
+    path: '{{ scanvix_certs_dir }}'
+    state: directory
+  when: scanvix_certs_dir is defined
+
+# Phase 6: win-acme's own ConfigurationPath (account/order/renewal state),
+# kept separate from certs\live\<hostname>\ where the actual PEM files
+# Mosquitto reads will live. win-acme creates its own ConfigurationPath if
+# missing, so pre-creating this is not strictly required -- it exists so
+# an administrator can apply restrictive ACLs to it ahead of any real
+# win-acme run, and so the on-disk layout matches the Phase 6 design
+# diagram before win-acme is ever installed.
+- name: DIRECTORIES | Create E:\StormEnergyRTU\certs\acme-state (win-acme ConfigurationPath -- Phase 6 design, not populated by this role)
+  ansible.windows.win_file:
+    path: '{{ scanvix_mqtt_acme_state_dir }}'
+    state: directory
+  when: scanvix_mqtt_acme_state_dir is defined
+
+# -- Task 6: verify (read-only, real execution only) --------------------------
+# Skipped in --check mode because creation tasks predict changes but do not
+# actually create directories. Verification after a dry-run would produce false
+# MISSING results for directories that would exist after a real run.
+
+- name: DIRECTORIES | Verify all Storm directories exist
+  ansible.windows.win_shell: |
+    $dirs = @(
+      'E:\StormEnergyRTU',
+      '{{ scanvix_app_dir }}',
+      '{{ scanvix_config_dir }}',
+      '{{ scanvix_logs_dir }}',
+      '{{ scanvix_scripts_dir }}'
+    )
+    if ('{{ scanvix_certs_dir | default("") }}' -ne '') {
+      $dirs += '{{ scanvix_certs_dir | default("") }}'
+    }
+    if ('{{ scanvix_mqtt_acme_state_dir | default("") }}' -ne '') {
+      $dirs += '{{ scanvix_mqtt_acme_state_dir | default("") }}'
+    }
+    $missing = @()
+    foreach ($d in $dirs) {
+      if (Test-Path $d) { Write-Output "OK      $d" }
+      else { Write-Output "MISSING $d"; $missing += $d }
+    }
+    if ($missing.Count -gt 0) {
+      Write-Error "Missing directories: $($missing -join ', ')"
+      exit 1
+    }
+  register: dir_check
+  changed_when: false
+  failed_when: dir_check.rc != 0
+  when: not ansible_check_mode
+
+# -- Task 7: report (safe in both modes) --------------------------------------
+
+- name: DIRECTORIES | Directory check report
+  ansible.builtin.debug:
+    msg: "{{ dir_check.stdout_lines | default(['(directory verification skipped in check mode -- run without --check to verify)']) }}"

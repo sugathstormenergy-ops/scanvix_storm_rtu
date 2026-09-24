@@ -1,0 +1,163 @@
+---
+# Storm Energy RTU — Windows Services Role
+#
+# ARCHITECTURE: app/main.py runs FastAPI + MQTTConsumer + TCPServer in ONE
+# uvicorn process. app/mqtt/consumer.py and app/tcp/server.py have no __main__
+# entry points, so standalone Python services for those modules cannot work.
+#
+# ONE service is created and managed by this role:
+#   StormEnergyRTU-API — uvicorn app.main:app
+#     ├── FastAPI REST API      → 0.0.0.0:{{ scanvix_api_port }}
+#     ├── MQTTConsumer          → subscribes to StormMosquitto on 127.0.0.1:{{ scanvix_mqtt_port }}
+#     └── TCPServer             → 0.0.0.0:{{ scanvix_tcp_port }}
+#
+# StormMosquitto (the broker) is managed by the mqtt role — not here.
+#
+# SAFETY: Only creates services with exact Storm names. Never modifies
+# AllipuramPFCMD-Go-Receiver or any existing service.
+
+- name: SERVICES | Check NSSM is present
+  ansible.windows.win_shell: |
+    $n = '{{ scanvix_nssm_exe }}'
+    if (-not (Test-Path $n)) { Write-Error "NSSM not found: $n"; exit 1 }
+    $v = (& $n version 2>&1) -join ' '
+    Write-Output "NSSM OK: $v"
+  register: nssm_check
+  changed_when: false
+  failed_when: nssm_check.rc != 0
+
+- name: SERVICES | NSSM check result
+  ansible.builtin.debug:
+    msg: "{{ nssm_check.stdout | trim }}"
+
+- name: SERVICES | Deploy API start script
+  ansible.windows.win_template:
+    src: storm_api_start.ps1.j2
+    dest: '{{ scanvix_install_dir }}\storm_api_start.ps1'
+
+# ── StormEnergyRTU-API — combined service (API + MQTT consumer + TCP server) ──
+- name: SERVICES | Register StormEnergyRTU-API (idempotent)
+  ansible.windows.win_shell: |
+    $n    = '{{ scanvix_nssm_exe }}'
+    $svc  = '{{ scanvix_api_service_name }}'
+    $exe  = 'powershell.exe'
+    $ps   = '{{ scanvix_install_dir }}\storm_api_start.ps1'
+    $dir  = '{{ scanvix_app_dir }}'
+    $wantParams = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ps`""
+
+    if (-not (Test-Path $ps)) {
+      Write-Error "storm_api_start.ps1 not found at $ps -- deploy script first"
+      exit 1
+    }
+
+    $existing = Get-Service -Name $svc -ErrorAction SilentlyContinue
+
+    if ($existing) {
+      $curApp    = ((& $n get $svc Application   2>&1) -join '').Trim()
+      $curParams = ((& $n get $svc AppParameters 2>&1) -join '').Trim()
+      $curDir    = ((& $n get $svc AppDirectory  2>&1) -join '').Trim()
+
+      $ok = ($curApp -eq $exe) -and ($curParams -eq $wantParams) -and ($curDir -eq $dir)
+      if ($ok) {
+        Write-Output "NSSM_CORRECT: $svc already correctly configured"
+        Write-Output "  Application   : $curApp"
+        Write-Output "  AppParameters : $curParams"
+        Write-Output "  AppDirectory  : $curDir"
+        exit 0
+      }
+
+      Write-Output "NSSM_RECONFIGURING: $svc settings differ"
+      Write-Output "  Application   was='$curApp'    want='$exe'"
+      Write-Output "  AppParameters was='$curParams' want='$wantParams'"
+      Write-Output "  AppDirectory  was='$curDir'    want='$dir'"
+
+      if ($existing.Status -eq 'Running') {
+        Stop-Service -Name $svc -Force -ErrorAction Stop
+        Start-Sleep -Seconds 3
+      }
+      & $n set $svc Application    $exe
+      & $n set $svc AppParameters  $wantParams
+      & $n set $svc AppDirectory   $dir
+      & $n set $svc AppExit        Default Restart
+      & $n set $svc AppRestartDelay 5000
+      & $n set $svc AppStdout      '{{ scanvix_logs_dir }}\api_stdout.log'
+      & $n set $svc AppStderr      '{{ scanvix_logs_dir }}\api_stderr.log'
+      Write-Output "NSSM_RECONFIGURED: $svc"
+      exit 0
+    }
+
+    # Fresh install
+    Write-Output "NSSM_INSTALLING: $svc"
+    & $n install $svc $exe
+    if ($LASTEXITCODE -ne 0) { Write-Error "nssm install failed (exit $LASTEXITCODE)"; exit 1 }
+
+    & $n set $svc AppParameters   $wantParams
+    & $n set $svc AppDirectory    $dir
+    & $n set $svc AppStdout       '{{ scanvix_logs_dir }}\api_stdout.log'
+    & $n set $svc AppStderr       '{{ scanvix_logs_dir }}\api_stderr.log'
+    & $n set $svc AppRestartDelay 5000
+    & $n set $svc AppExit         Default Restart
+    & $n set $svc Start           SERVICE_AUTO_START
+    & $n set $svc DisplayName     'Storm Energy RTU - API + MQTT + TCP'
+    & $n set $svc Description     'Storm Energy RTU combined: FastAPI :{{ scanvix_api_port }}, MQTT consumer, TCP :{{ scanvix_tcp_port }}'
+    Write-Output "NSSM_INSTALLED: $svc"
+  register: api_svc_reg
+  changed_when: >-
+    'NSSM_INSTALLED' in api_svc_reg.stdout or
+    'NSSM_RECONFIGURED' in api_svc_reg.stdout
+
+- name: SERVICES | Service registration result
+  ansible.builtin.debug:
+    msg: "{{ api_svc_reg.stdout_lines }}"
+
+# ── Set service account for Windows Integrated Authentication ─────────────────
+# StormEnergyRTU-API must run as svc_ansible so that pyodbc Trusted_Connection=yes
+# authenticates to SQL Server as a known principal (svc_ansible is sysadmin).
+# ansible_password is the Windows account password already in hosts.ini.
+- name: SERVICES | Set StormEnergyRTU-API service account (svc_ansible)
+  ansible.windows.win_shell: |
+    $n   = '{{ scanvix_nssm_exe }}'
+    $svc = '{{ scanvix_api_service_name }}'
+    $acct = '{{ scanvix_svc_account }}'
+
+    $curObj = ((& $n get $svc ObjectName 2>&1) -join '').Trim()
+    if ($curObj -ieq $acct) {
+      Write-Output "SVC_ACCOUNT_CORRECT: $svc already running as $acct"
+      exit 0
+    }
+
+    Write-Output "SVC_ACCOUNT_SETTING: $svc ObjectName=$acct (was=$curObj)"
+    & $n set $svc ObjectName $acct $env:SVC_PASS
+    if ($LASTEXITCODE -ne 0) {
+      Write-Error "nssm set ObjectName failed (exit $LASTEXITCODE)"
+      exit 1
+    }
+    Write-Output "SVC_ACCOUNT_SET: $svc will run as $acct"
+  environment:
+    SVC_PASS: "{{ ansible_password }}"
+  register: svc_account_set
+  changed_when: "'SVC_ACCOUNT_SET' in svc_account_set.stdout"
+  no_log: true
+
+- name: SERVICES | Service account result
+  ansible.builtin.debug:
+    msg: "{{ svc_account_set.stdout | trim }}"
+
+
+- name: SERVICES | Start StormEnergyRTU-API
+  ansible.windows.win_service:
+    name: '{{ scanvix_api_service_name }}'
+    state: started
+    start_mode: auto
+
+- name: SERVICES | Confirm StormEnergyRTU-API state
+  ansible.windows.win_shell: |
+    $svc = Get-Service -Name '{{ scanvix_api_service_name }}' -ErrorAction SilentlyContinue
+    if ($svc) { Write-Output "$($svc.Name) : $($svc.Status)" }
+    else       { Write-Output "{{ scanvix_api_service_name }} : NOT FOUND" }
+  register: svc_status
+  changed_when: false
+
+- name: SERVICES | Status
+  ansible.builtin.debug:
+    msg: "{{ svc_status.stdout | trim }}"

@@ -1,0 +1,14 @@
+---
+# Storm Energy RTU — storm_rtu role handlers
+
+- name: Restart Storm services
+  ansible.windows.win_shell: |
+    $names = @('{{ scanvix_api_service_name }}','{{ scanvix_mqtt_service_name }}','{{ scanvix_tcp_service_name }}')
+    foreach ($n in $names) {
+      $svc = Get-Service -Name $n -ErrorAction SilentlyContinue
+      if ($svc -and $svc.Status -eq 'Running') {
+        Restart-Service -Name $n -Force
+        "Restarted: $n"
+      }
+    }
+  changed_when: true

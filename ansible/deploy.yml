@@ -1,0 +1,68 @@
+---
+# Storm Energy RTU Platform — Main Deployment Playbook
+# Usage: ansible-playbook -i inventory/hosts.yml deploy.yml --ask-vault-pass
+
+- name: Deploy Storm Energy RTU Platform
+  hosts: rtu_servers
+  become: true
+
+  pre_tasks:
+    - name: Verify Ansible version
+      ansible.builtin.assert:
+        that: "ansible_version.full is version('2.14', '>=')"
+        msg:  "Ansible 2.14+ required"
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+  roles:
+    - role: python
+      tags: [python, app]
+
+    - role: mosquitto
+      tags: [mqtt, mosquitto]
+
+    - role: storm_rtu
+      tags: [app, services]
+
+    - role: firewall
+      tags: [firewall, security]
+
+  post_tasks:
+    - name: Verify API health check
+      ansible.builtin.uri:
+        url:            "http://{{ ansible_host }}:{{ api_port }}/health"
+        return_content: true
+        status_code:    200
+      register: health_result
+      retries:  10
+      delay:    5
+      until:    health_result.status == 200
+
+    - name: Print deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "Storm Energy RTU Platform deployed successfully"
+          - "API endpoint: http://{{ ansible_host }}:{{ api_port }}"
+          - "API docs:     http://{{ ansible_host }}:{{ api_port }}/docs"
+          - "Health check: http://{{ ansible_host }}:{{ api_port }}/health"
+          - "MQTT:         {{ mqtt_host }}:{{ mqtt_port }}"
+          - "TCP:          {{ ansible_host }}:{{ tcp_port }}"
+
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: restart storm-rtu-api
+      ansible.builtin.systemd:
+        name:  storm-rtu-api
+        state: restarted
+
+    - name: restart mosquitto
+      ansible.builtin.systemd:
+        name:  mosquitto
+        state: restarted

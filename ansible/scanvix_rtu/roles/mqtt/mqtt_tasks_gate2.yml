@@ -1,0 +1,552 @@
+---
+# Storm Energy RTU — MQTT Role — Gate 2 Tasks
+# =============================================
+# SCOPE: Activate authentication on the existing Mosquitto broker.
+#   1. Create/update Storm password file (storm_passwd) — no_log, never committed
+#   2. Deploy updated mosquitto_storm.conf (127.0.0.1 bind + password_file active)
+#   3. Validate config directives before touching the service
+#   4. Update service binpath to use -c mosquitto_storm.conf
+#   5. Restart service and wait for Running state
+#   6. Verify port 1883 still loopback-only
+#   7. Test authenticated publish
+#   8. Confirm anonymous and wrong-password are rejected
+#
+# SAFETY: Does not restart AllipuramPFCMD-Go-Receiver, modify port 8088,
+#         or touch any Allipuram resource. Mosquitto restart is brief (~2s).
+#
+# Credentials: scanvix_mqtt_username and scanvix_mqtt_password MUST be
+# supplied via --extra-vars. They are NEVER in group_vars or source control.
+
+# ── 0. Create Storm MQTT data directory with secure ACLs ─────────────────────
+# C:\ProgramData\StormEnergyRTU\Mosquitto is outside Program Files so
+# svc_ansible can write the password database without broad privilege grants.
+# ACLs: SYSTEM=FullControl, Administrators=FullControl, svc_ansible=Modify.
+# BUILTIN\Users is intentionally excluded.
+- name: MQTT-G2 | Create Storm MQTT data directory with secure ACLs
+  ansible.windows.win_shell: |
+    $dir = '{{ scanvix_mqtt_passwd_dir }}'
+
+    # Create directory (and any missing parents) if absent
+    if (-not (Test-Path $dir)) {
+      New-Item -ItemType Directory -Path $dir -Force | Out-Null
+      Write-Output "DIR_CREATED: $dir"
+    } else {
+      Write-Output "DIR_EXISTS: $dir"
+    }
+
+    # Apply explicit ACL — disable inheritance, set only named principals
+    $acl = Get-Acl $dir
+    $acl.SetAccessRuleProtection($true, $false)   # break inheritance, clear inherited entries
+
+    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+    $none    = [System.Security.AccessControl.PropagationFlags]::None
+    $allow   = [System.Security.AccessControl.AccessControlType]::Allow
+
+    $rules = @(
+      [System.Security.AccessControl.FileSystemAccessRule]::new(
+        'NT AUTHORITY\SYSTEM', 'FullControl', $inherit, $none, $allow),
+      [System.Security.AccessControl.FileSystemAccessRule]::new(
+        'BUILTIN\Administrators', 'FullControl', $inherit, $none, $allow),
+      [System.Security.AccessControl.FileSystemAccessRule]::new(
+        'desktop-fl70n9e\svc_ansible', 'Modify', $inherit, $none, $allow)
+    )
+    foreach ($rule in $rules) { $acl.AddAccessRule($rule) }
+    Set-Acl -Path $dir -AclObject $acl
+
+    # Confirm effective ACL
+    $effective = (Get-Acl $dir).Access | ForEach-Object {
+      "$($_.IdentityReference) => $($_.FileSystemRights)"
+    }
+    Write-Output "ACL_SET:"
+    $effective | ForEach-Object { Write-Output "  $_" }
+  register: mqtt_data_dir
+  changed_when: "'DIR_CREATED' in mqtt_data_dir.stdout"
+  failed_when: mqtt_data_dir.rc != 0
+
+- name: MQTT-G2 | Data directory result
+  ansible.builtin.debug:
+    var: mqtt_data_dir
+
+# ── 1. Create / update Storm MQTT password file ───────────────────────────────
+# This installation's mosquitto_passwd.exe cannot create a new password file
+# from scratch — it fails with "Bad file descriptor" when the target file is absent.
+# Diagnostic confirmed: pre-creating an empty file then running mosquitto_passwd -b
+# succeeds. The pre-create step below handles this; it is idempotent (no-op if the
+# file already exists) and contains no password material.
+- name: MQTT-G2 | Ensure storm_passwd file exists (pre-create if absent)
+  ansible.windows.win_shell: |
+    $file = '{{ scanvix_mqtt_passwd_file }}'
+    if (-not (Test-Path $file)) {
+      New-Item -ItemType File -Path $file -Force | Out-Null
+      Write-Output "PASSWD_FILE_CREATED: $file"
+    } else {
+      Write-Output "PASSWD_FILE_EXISTS: $file"
+    }
+  register: mqtt_passwd_precreate
+  changed_when: "'PASSWD_FILE_CREATED' in mqtt_passwd_precreate.stdout"
+  failed_when: mqtt_passwd_precreate.rc != 0
+
+- name: MQTT-G2 | storm_passwd pre-create result
+  ansible.builtin.debug:
+    var: mqtt_passwd_precreate
+
+# mosquitto_passwd -b adds/updates the named user in the existing file.
+# The plaintext password is hashed by the tool — only the hash is stored.
+# no_log: true prevents the password appearing in any Ansible output or log.
+- name: MQTT-G2 | Create / update storm_passwd (no_log)
+  ansible.windows.win_shell: |
+    $exe = 'C:\Program Files\Mosquitto\mosquitto_passwd.exe'
+    if (-not (Test-Path $exe)) {
+      Write-Error "mosquitto_passwd.exe not found at: $exe"
+      exit 1
+    }
+    # -b = batch mode: non-interactive, creates file if absent, updates user if present
+    & $exe -b '{{ scanvix_mqtt_passwd_file }}' `
+        '{{ scanvix_mqtt_username }}' `
+        '{{ scanvix_mqtt_password }}'
+    if ($LASTEXITCODE -ne 0) {
+      Write-Error "mosquitto_passwd failed with exit code $LASTEXITCODE"
+      exit 1
+    }
+    Write-Output "storm_passwd: entry created/updated"
+  no_log: true
+  register: mqtt_passwd_result
+  changed_when: true
+  when: scanvix_mqtt_manage_prod_credential | default(true) | bool
+
+- name: MQTT-G2 | storm_passwd result
+  ansible.builtin.debug:
+    var: mqtt_passwd_result
+
+# ── 2. Verify password file exists ────────────────────────────────────────────
+- name: MQTT-G2 | Verify storm_passwd file was created
+  ansible.windows.win_stat:
+    path: '{{ scanvix_mqtt_passwd_file }}'
+  register: storm_passwd_stat
+  failed_when: not storm_passwd_stat.stat.exists and not ansible_check_mode
+
+- name: MQTT-G2 | storm_passwd location
+  ansible.builtin.debug:
+    var: storm_passwd_stat
+
+# ── 2b. Deploy ACL file — REQUIRED once TLS is enabled ────────────────────────
+# mosquitto.conf.j2's TLS (8883) block renders `acl_file` unconditionally
+# (see that template's own comment, Phase 5 finding): there is deliberately
+# no "TLS on, ACL off" state for that listener. If this file is not present
+# before the config below is activated, Mosquitto will fail to start with a
+# missing-acl_file error. Content is the EXISTING Phase 4 design
+# (roles/mqtt/templates/storm_acl.j2) — not new policy; this task only
+# materializes it. No-op (and no acl_file reference exists at all) when TLS
+# is disabled, preserving current behaviour exactly for any other invocation
+# of this same task file.
+- name: MQTT-G2 | Deploy storm_acl (required once TLS listener is enabled)
+  ansible.windows.win_template:
+    src: storm_acl.j2
+    dest: '{{ scanvix_mqtt_acl_file }}'
+  when: scanvix_mqtt_tls_enabled | default(false) | bool
+  register: mqtt_acl_deploy
+
+- name: MQTT-G2 | ACL deploy result
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'storm_acl deployed to ' + scanvix_mqtt_acl_file if (scanvix_mqtt_tls_enabled | default(false) | bool)
+         else 'ACL file not deployed (scanvix_mqtt_tls_enabled is false — unchanged from current behaviour)' }}
+
+# ── 3. Deploy Storm Mosquitto configuration ────────────────────────────────────
+# Template now has: listener <port> 127.0.0.1  +  password_file active
+- name: MQTT-G2 | Deploy Storm Mosquitto configuration
+  ansible.windows.win_template:
+    src: mosquitto.conf.j2
+    dest: 'C:\ProgramData\StormEnergyRTU\Mosquitto\mosquitto_storm.conf'
+  register: mqtt_conf_deploy
+
+# ── 4. Validate config directives ─────────────────────────────────────────────
+- name: MQTT-G2 | Validate config has required security directives
+  ansible.windows.win_shell: |
+    $conf = 'C:\ProgramData\StormEnergyRTU\Mosquitto\mosquitto_storm.conf'
+    $content = Get-Content $conf -Raw -ErrorAction Stop
+
+    $errors = @()
+    if ($content -notmatch 'password_file') {
+      $errors += "MISSING: password_file directive"
+    }
+    if ($content -match '^\s*#\s*password_file') {
+      $errors += "password_file is still commented out"
+    }
+    if ($content -notmatch 'allow_anonymous\s+false') {
+      $errors += "MISSING: allow_anonymous false"
+    }
+    if ($content -notmatch 'listener\s+\d+\s+127\.0\.0\.1') {
+      $errors += "MISSING: listener <port> 127.0.0.1 (explicit loopback bind)"
+    }
+
+    if ($errors.Count -gt 0) {
+      foreach ($e in $errors) { Write-Error $e }
+      exit 1
+    }
+    Write-Output "CONFIG VALID: password_file, allow_anonymous false, 127.0.0.1 bind all confirmed"
+  register: mqtt_conf_validate
+  changed_when: false
+  failed_when: mqtt_conf_validate.rc != 0
+
+- name: MQTT-G2 | Config validation result
+  ansible.builtin.debug:
+    var: mqtt_conf_validate
+
+# ── 4b. Validate config PARSES with Mosquitto itself (--test-config) ──────────
+# The check above is a text/regex assertion about specific directives; it does
+# not confirm Mosquitto's own parser accepts the file (e.g. TLS directive
+# syntax, listener ordering, multi-listener conflicts). Mosquitto 2.1.2 uses
+# --test-config -- NOT -t, which this version rejects with "Unknown option".
+# Runs BEFORE any service is touched (matches the task's own "validate before
+# restart" requirement); does not start the broker.
+- name: MQTT-G2 | Validate config parses with Mosquitto itself (--test-config)
+  ansible.windows.win_command: >
+    "{{ scanvix_mosquitto_exe }}" -c "C:\ProgramData\StormEnergyRTU\Mosquitto\mosquitto_storm.conf" --test-config
+  register: mqtt_conf_test
+  changed_when: false
+  failed_when: mqtt_conf_test.rc != 0
+
+- name: MQTT-G2 | Mosquitto --test-config result
+  ansible.builtin.debug:
+    msg: "rc={{ mqtt_conf_test.rc }} | {{ (mqtt_conf_test.stdout_lines + mqtt_conf_test.stderr_lines) }}"
+
+# ── 5. Stop and disable native mosquitto service (port-conflict prevention) ────
+# The Mosquitto Windows installer registers a 'mosquitto' Windows service with
+# default config. StormMosquitto will own port 1883; the native service must not
+# auto-start and compete on reboot. Disabling is safe: it does not remove the
+# Mosquitto software and can be reversed by Gate 1 if ever needed.
+- name: MQTT-G2 | Stop and disable native mosquitto service
+  ansible.windows.win_service:
+    name: "{{ scanvix_native_mqtt_service_name }}"
+    state: stopped
+    start_mode: disabled
+  failed_when: false   # non-fatal: may already be stopped/disabled or absent
+
+- name: MQTT-G2 | Native mosquitto service state (post-disable)
+  ansible.windows.win_shell: |
+    $s = Get-Service -Name '{{ scanvix_native_mqtt_service_name }}' -ErrorAction SilentlyContinue
+    if ($s) { "$($s.Name): Status=$($s.Status)  StartType=$($s.StartType)" }
+    else    { "native mosquitto service not present on this host" }
+  register: mqtt_native_state
+  changed_when: false
+
+- name: MQTT-G2 | Native service state
+  ansible.builtin.debug:
+    var: mqtt_native_state
+
+# ── 6. Create / correct StormMosquitto NSSM service ───────────────────────────
+# Uses mosquitto.exe in STANDALONE mode (-c "config"), NOT 'run -c ...'
+# The 'run' subcommand calls StartServiceCtrlDispatcher internally, which fails
+# when mosquitto is a child process of nssm.exe (not the actual SCM-registered
+# executable), causing instant exit → SERVICE_PAUSED restart loop.
+#
+# Idempotency:
+#   Service absent   → install with correct settings     (NSSM_INSTALLED)
+#   Service present, Application/AppParameters/AppDirectory correct → skip
+#                                                         (NSSM_CORRECT)
+#   Service present, any critical setting wrong → stop + correct in place
+#                                                         (NSSM_RECONFIGURED)
+# AppExit Default Restart is applied on every install or reconfigure to
+# guarantee the PAUSED state can never be reached through exit-action config.
+- name: MQTT-G2 | Create or correct StormMosquitto NSSM service
+  ansible.windows.win_shell: |
+    $nssm   = '{{ scanvix_nssm_exe }}'
+    $svc    = '{{ scanvix_storm_mqtt_service_name }}'
+    $exe    = 'C:\Program Files\Mosquitto\mosquitto.exe'
+    $dir    = 'C:\Program Files\Mosquitto'
+    $conf   = 'C:\ProgramData\StormEnergyRTU\Mosquitto\mosquitto_storm.conf'
+    $logdir = '{{ scanvix_mqtt_passwd_dir }}'
+    $params = "-c $conf"
+
+    if (-not (Test-Path $nssm)) { Write-Error "NSSM not found: $nssm"; exit 1 }
+    if (-not (Test-Path $exe))  { Write-Error "mosquitto.exe not found: $exe"; exit 1 }
+    if (-not (Test-Path $conf)) {
+      Write-Error "mosquitto_storm.conf not found: $conf — deploy config before this task"
+      exit 1
+    }
+
+    $existing = Get-Service -Name $svc -ErrorAction SilentlyContinue
+
+    if ($existing) {
+      # Read current NSSM settings and compare against desired values.
+      # nssm get outputs the stored value to stdout; errors go to stderr (2>&1 merges).
+      $curApp    = ((& $nssm get $svc Application    2>&1) -join '').Trim()
+      $curParams = ((& $nssm get $svc AppParameters  2>&1) -join '').Trim()
+      $curDir    = ((& $nssm get $svc AppDirectory   2>&1) -join '').Trim()
+
+      $ok = ($curApp -eq $exe) -and ($curParams -eq $params) -and ($curDir -eq $dir)
+
+      if ($ok) {
+        Write-Output "NSSM_CORRECT: $svc already correctly configured"
+        Write-Output "  Application   : $curApp"
+        Write-Output "  AppParameters : $curParams"
+        Write-Output "  AppDirectory  : $curDir"
+        exit 0
+      }
+
+      Write-Output "NSSM_RECONFIGURING: $svc exists but settings differ"
+      Write-Output "  Application   was='$curApp'    want='$exe'"
+      Write-Output "  AppParameters was='$curParams' want='$params'"
+      Write-Output "  AppDirectory  was='$curDir'    want='$dir'"
+
+      # Stop before reconfiguring
+      if ($existing.Status -eq 'Running') {
+        Stop-Service -Name $svc -Force -ErrorAction Stop
+        Start-Sleep -Seconds 3
+      }
+
+      & $nssm set $svc Application    $exe
+      & $nssm set $svc AppParameters  $params
+      & $nssm set $svc AppDirectory   $dir
+      & $nssm set $svc AppExit        Default Restart
+      & $nssm set $svc AppRestartDelay 3000
+      & $nssm set $svc AppThrottle    1500
+      & $nssm set $svc AppStdout      "$logdir\mosquitto_stdout.log"
+      & $nssm set $svc AppStderr      "$logdir\mosquitto_stderr.log"
+
+      Write-Output "NSSM_RECONFIGURED"
+      exit 0
+    }
+
+    # Service absent — install fresh
+    Write-Output "NSSM_INSTALLING: creating $svc"
+
+    & $nssm install $svc $exe
+    if ($LASTEXITCODE -ne 0) { Write-Error "nssm install failed (exit $LASTEXITCODE)"; exit 1 }
+
+    # Standalone mode: -c "conf" — no 'run' subcommand
+    & $nssm set $svc AppParameters   $params
+    & $nssm set $svc AppDirectory    $dir
+    & $nssm set $svc AppStdout       "$logdir\mosquitto_stdout.log"
+    & $nssm set $svc AppStderr       "$logdir\mosquitto_stderr.log"
+    & $nssm set $svc DisplayName     'Storm Energy RTU — MQTT Broker'
+    & $nssm set $svc Description     'Mosquitto 2.x MQTT broker with Storm Energy RTU authentication'
+    & $nssm set $svc AppExit         Default Restart
+    & $nssm set $svc AppRestartDelay 3000
+    & $nssm set $svc AppThrottle     1500
+    & $nssm set $svc Start           SERVICE_AUTO_START
+
+    Write-Output "NSSM_INSTALLED: $svc"
+  register: mqtt_nssm_create
+  changed_when: >-
+    'NSSM_INSTALLED' in mqtt_nssm_create.stdout or
+    'NSSM_RECONFIGURED' in mqtt_nssm_create.stdout
+
+- name: MQTT-G2 | NSSM service create/correct result
+  ansible.builtin.debug:
+    var: mqtt_nssm_create
+
+# ── 7. Start StormMosquitto ────────────────────────────────────────────────────
+- name: MQTT-G2 | Start StormMosquitto service
+  ansible.windows.win_service:
+    name: "{{ scanvix_storm_mqtt_service_name }}"
+    state: started
+    start_mode: auto
+  register: mqtt_storm_start
+
+# ── 7b. Restart if config content actually changed ────────────────────────────
+# win_service state=started is a no-op when the service is already Running --
+# Mosquitto only re-reads mosquitto_storm.conf at process start, so a config
+# change (e.g. adding/removing the bench listener) needs an explicit restart
+# to take effect. Only fires when the template deploy in step 3 reported a
+# real content change; a normal idempotent re-run with unchanged config never
+# triggers this and behaves exactly as before.
+- name: MQTT-G2 | Restart StormMosquitto if configuration content changed
+  ansible.windows.win_service:
+    name: "{{ scanvix_storm_mqtt_service_name }}"
+    state: restarted
+  when: mqtt_conf_deploy.changed | default(false)
+  register: mqtt_storm_restart
+
+- name: MQTT-G2 | Config-change restart result
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'StormMosquitto restarted (configuration changed).' if (mqtt_conf_deploy.changed | default(false))
+         else 'No restart needed (configuration content unchanged).' }}
+
+# ── 8. Wait for StormMosquitto to reach Running (max 30 s) ───────────────────
+- name: MQTT-G2 | Wait for StormMosquitto to reach Running
+  ansible.windows.win_shell: |
+    $svcName = '{{ scanvix_storm_mqtt_service_name }}'
+    $maxWait = 30
+    $waited  = 0
+    while ($waited -lt $maxWait) {
+      $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+      if ($svc -and $svc.Status -eq 'Running') {
+        Write-Output "$($svcName): Running after ${waited}s"
+        exit 0
+      }
+      if ($svc -and $svc.Status -eq 'Paused') {
+        Write-Error "$svcName entered SERVICE_PAUSED — check NSSM AppExit and {{ scanvix_mqtt_passwd_dir }}\mosquitto_stderr.log"
+        exit 1
+      }
+      Start-Sleep -Seconds 1
+      $waited++
+    }
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    Write-Error "$svcName did not reach Running within ${maxWait}s — state: $($svc.Status)"
+    exit 1
+  register: mqtt_wait
+  changed_when: false
+  failed_when: mqtt_wait.rc != 0
+
+- name: MQTT-G2 | Service start result
+  ansible.builtin.debug:
+    var: mqtt_wait
+
+# ── 9. Verify StormMosquitto: state, mosquitto.exe process, port 1883 ─────────
+- name: MQTT-G2 | Verify StormMosquitto state, process, and port binding
+  ansible.windows.win_shell: |
+    $svcName = '{{ scanvix_storm_mqtt_service_name }}'
+
+    # Service state
+    $svc = Get-CimInstance Win32_Service -Filter "Name='$svcName'"
+    if (-not $svc) { Write-Error "$svcName not found in SCM"; exit 1 }
+    Write-Output "State    : $($svc.State)"
+    Write-Output "StartMode: $($svc.StartMode)"
+    Write-Output "PathName : $($svc.PathName)"
+    if ($svc.State -ne 'Running') {
+      Write-Error "$svcName is $($svc.State) — expected Running"
+      exit 1
+    }
+
+    # mosquitto.exe process
+    $proc = Get-Process -Name 'mosquitto' -ErrorAction SilentlyContinue
+    if ($proc) { Write-Output "Process  : mosquitto.exe PID=$($proc.Id)" }
+    else { Write-Error "mosquitto.exe process not found — broker is not running"; exit 1 }
+
+    # Port 1883 — loopback only
+    $bindings = Get-NetTCPConnection -LocalPort 1883 -State Listen -ErrorAction SilentlyContinue
+    if (-not $bindings) { Write-Error "Port 1883 not listening — broker may have failed"; exit 1 }
+    foreach ($b in $bindings) {
+      Write-Output "LISTEN   $($b.LocalAddress):$($b.LocalPort)  PID=$($b.OwningProcess)"
+    }
+    $ext = $bindings | Where-Object { $_.LocalAddress -notin @('127.0.0.1','::1') }
+    if ($ext) { Write-Error "SECURITY: unexpected external binding on port 1883"; exit 1 }
+    Write-Output "BINDING OK: loopback-only confirmed"
+
+    # Confirm AllipuramPFCMD-Go-Receiver is untouched
+    $recv = Get-Service -Name 'AllipuramPFCMD-Go-Receiver' -ErrorAction SilentlyContinue
+    if ($recv) { Write-Output "GoReceiver: $($recv.Status) (unchanged)" }
+    else       { Write-Output "GoReceiver: not found on this host" }
+  register: mqtt_verify_svc
+  changed_when: false
+  failed_when: mqtt_verify_svc.rc != 0
+
+- name: MQTT-G2 | Service verification
+  ansible.builtin.debug:
+    var: mqtt_verify_svc
+
+# ── 10. Verify port 1883 binding (loopback only) ──────────────────────────────
+- name: MQTT-G2 | Verify port 1883 is listening
+  ansible.windows.win_shell: |
+    $bindings = Get-NetTCPConnection -LocalPort 1883 -State Listen -ErrorAction SilentlyContinue
+    if (-not $bindings) {
+      Write-Error "Port 1883 is not listening — broker may have failed to start"
+      exit 1
+    }
+    foreach ($b in $bindings) {
+      $proc = Get-Process -Id $b.OwningProcess -ErrorAction SilentlyContinue
+      Write-Output "LISTEN  $($b.LocalAddress):$($b.LocalPort)  PID=$($b.OwningProcess)  ($($proc.Name))"
+    }
+    # Verify no 0.0.0.0 binding (which would allow external access)
+    $external = $bindings | Where-Object { $_.LocalAddress -notin @('127.0.0.1','::1') }
+    if ($external) {
+      foreach ($e in $external) {
+        Write-Output "SECURITY WARNING: unexpected external binding on $($e.LocalAddress):$($e.LocalPort)"
+      }
+      exit 1
+    }
+    Write-Output "BINDING OK: loopback-only confirmed"
+  register: mqtt_verify_port
+  changed_when: false
+  failed_when: mqtt_verify_port.rc != 0
+
+- name: MQTT-G2 | Port binding verification
+  ansible.builtin.debug:
+    var: mqtt_verify_port
+
+# ── 11. Security test: authenticated publish ──────────────────────────────────
+# no_log prevents the password appearing in task input (command args).
+# stdout only contains "AUTH_PUBLISH: SUCCESS" — safe to show in next debug.
+- name: MQTT-G2 | TEST — authenticated publish (should succeed)
+  ansible.windows.win_shell: |
+    $pub = 'C:\Program Files\Mosquitto\mosquitto_pub.exe'
+    if (-not (Test-Path $pub)) {
+      Write-Output "SKIP: mosquitto_pub.exe not found — manual test required"
+      exit 0
+    }
+    & $pub -h 127.0.0.1 -p {{ scanvix_mqtt_port }} `
+        -u '{{ scanvix_mqtt_username }}' `
+        -P '{{ scanvix_mqtt_password }}' `
+        -t 'storm/test/gate2' `
+        -m 'gate2-auth-ok' 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+      Write-Output "AUTH_PUBLISH: SUCCESS (exit 0)"
+    } else {
+      Write-Error "AUTH_PUBLISH: FAILED (exit $LASTEXITCODE) — check credentials and broker logs"
+      exit 1
+    }
+  no_log: true
+  register: mqtt_test_auth
+  changed_when: false
+  failed_when: mqtt_test_auth.rc != 0
+  when: scanvix_mqtt_manage_prod_credential | default(true) | bool
+
+- name: MQTT-G2 | Authenticated publish result
+  ansible.builtin.debug:
+    var: mqtt_test_auth
+
+# ── 12. Security test: anonymous publish (must be rejected) ───────────────────
+- name: MQTT-G2 | TEST — anonymous publish (must be rejected)
+  ansible.windows.win_shell: |
+    $pub = 'C:\Program Files\Mosquitto\mosquitto_pub.exe'
+    if (-not (Test-Path $pub)) {
+      Write-Output "SKIP: mosquitto_pub.exe not found"
+      exit 0
+    }
+    & $pub -h 127.0.0.1 -p {{ scanvix_mqtt_port }} `
+        -t 'storm/test/gate2-anon' `
+        -m 'anon-attempt' 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      Write-Output "ANON_REJECT: CONFIRMED — anonymous connection refused (exit $LASTEXITCODE)"
+    } else {
+      Write-Error "SECURITY FAIL: anonymous publish was ACCEPTED — allow_anonymous false not enforced"
+      exit 1
+    }
+  register: mqtt_test_anon
+  changed_when: false
+  failed_when: mqtt_test_anon.rc != 0
+
+- name: MQTT-G2 | Anonymous rejection result
+  ansible.builtin.debug:
+    var: mqtt_test_anon
+
+# ── 13. Security test: wrong password (must be rejected) ─────────────────────
+- name: MQTT-G2 | TEST — wrong password (must be rejected)
+  ansible.windows.win_shell: |
+    $pub = 'C:\Program Files\Mosquitto\mosquitto_pub.exe'
+    if (-not (Test-Path $pub)) {
+      Write-Output "SKIP: mosquitto_pub.exe not found"
+      exit 0
+    }
+    & $pub -h 127.0.0.1 -p {{ scanvix_mqtt_port }} `
+        -u '{{ scanvix_mqtt_username }}' `
+        -P 'definitely-wrong-password-gate2' `
+        -t 'storm/test/gate2-badauth' `
+        -m 'bad-auth-attempt' 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      Write-Output "BADAUTH_REJECT: CONFIRMED — wrong password refused (exit $LASTEXITCODE)"
+    } else {
+      Write-Error "SECURITY FAIL: wrong-password publish was ACCEPTED — password file not being enforced"
+      exit 1
+    }
+  register: mqtt_test_badauth
+  changed_when: false
+  failed_when: mqtt_test_badauth.rc != 0
+  when: scanvix_mqtt_manage_prod_credential | default(true) | bool
+
+- name: MQTT-G2 | Wrong-password rejection result
+  ansible.builtin.debug:
+    var: mqtt_test_badauth

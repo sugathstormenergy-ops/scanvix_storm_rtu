@@ -1,0 +1,33 @@
+---
+- name: Listening ports (Get-NetTCPConnection)
+  ansible.windows.win_shell: |
+    $l = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue
+    Write-Output ("P9000=" + (@($l | Where-Object LocalPort -eq 9000).Count))
+    Write-Output ("P8090=" + (@($l | Where-Object LocalPort -eq 8090).Count))
+  changed_when: false
+  register: ports
+
+- name: Existing health endpoint
+  ansible.windows.win_uri: { url: "{{ api_base }}/health", method: GET, status_code: 200, return_content: true }
+  register: health
+  failed_when: false
+
+- name: Existing /health/tcp must still work
+  ansible.windows.win_uri: { url: "{{ api_base }}/health/tcp", method: GET, status_code: 200, return_content: true }
+  register: health_tcp
+  failed_when: false
+
+- name: New viewer API
+  ansible.windows.win_uri: { url: "{{ api_base }}/api/tcp-logs?limit=50", method: GET, status_code: 200, return_content: true }
+  register: tcp_api
+  failed_when: false
+
+- name: New viewer page
+  ansible.windows.win_uri: { url: "{{ api_base }}/tcp-logs", method: GET, status_code: 200 }
+  register: viewer_page
+  failed_when: false
+
+- name: Public viewer (optional; no network changes made)
+  ansible.windows.win_uri: { url: "{{ public_url }}", method: GET, status_code: 200, timeout: 8 }
+  register: public_page
+  failed_when: false

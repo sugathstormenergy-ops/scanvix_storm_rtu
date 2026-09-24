@@ -1,0 +1,115 @@
+---
+# READ-ONLY verification of the LIVE StormEnergyRTU-API runtime configuration.
+# No SQL connection is made here (the DB path was already validated in the
+# prior diagnostic). This checks the Windows service, NSSM config, and the
+# deployed .env -- all read-only. No file/service/DB/firewall change of any
+# kind. No secret value is ever printed -- password/secret-shaped keys are
+# reported as PRESENT/EMPTY (with length) only, never their value.
+#
+#   cd /mnt/e/scanvix_RTU/storm-energy-rtu/ansible/scanvix_rtu
+#   export ANSIBLE_ROLES_PATH="$(pwd)/roles"
+#   ansible-playbook -i inventory/hosts.ini playbooks/api_runtime_config_check.yml --syntax-check
+#   ansible-playbook -i inventory/hosts.ini playbooks/api_runtime_config_check.yml
+
+- name: READ-ONLY StormEnergyRTU-API runtime configuration verification
+  hosts: scanvix109
+  gather_facts: false
+  vars:
+    api_service_name: 'StormEnergyRTU-API'
+    nssm_exe:          'D:\AllipuramPFCMD\Receiver\nssm.exe'
+    expected_app_dir:  'E:\StormEnergyRTU\app'
+
+  tasks:
+
+    - name: Connectivity gate
+      ansible.windows.win_ping: {}
+
+    - name: 1/2 — Service existence, status, start type, Log On As account
+      check_mode: false
+      ansible.windows.win_shell: |
+        $svc = Get-CimInstance Win32_Service -Filter "Name='{{ api_service_name }}'"
+        if (-not $svc) {
+          "RESULT|Found=NO"
+        } else {
+          "RESULT|Found=YES|State=$($svc.State)|StartMode=$($svc.StartMode)|LogOnAs=$($svc.StartName)"
+        }
+      register: svc_check
+      changed_when: false
+
+    - name: 3 — NSSM Application / AppDirectory / AppParameters
+      check_mode: false
+      ansible.windows.win_shell: |
+        $app    = ((& "{{ nssm_exe }}" get "{{ api_service_name }}" Application    2>&1) -join '').Trim()
+        $dir    = ((& "{{ nssm_exe }}" get "{{ api_service_name }}" AppDirectory   2>&1) -join '').Trim()
+        $params = ((& "{{ nssm_exe }}" get "{{ api_service_name }}" AppParameters  2>&1) -join '').Trim()
+        "RESULT|Application=$app"
+        "RESULT|AppDirectory=$dir"
+        "RESULT|AppParameters=$params"
+      register: nssm_check
+      changed_when: false
+
+    - name: 6 — Confirm .env actually exists at AppDirectory (proves the working-directory-relative lookup resolves)
+      check_mode: false
+      ansible.windows.win_shell: |
+        $dir  = ((& "{{ nssm_exe }}" get "{{ api_service_name }}" AppDirectory 2>&1) -join '').Trim()
+        $envPath = Join-Path $dir '.env'
+        $dirMatchesExpected = ($dir -ieq '{{ expected_app_dir }}')
+        "RESULT|AppDirectory=$dir"
+        "RESULT|MatchesExpected({{ expected_app_dir }})=$dirMatchesExpected"
+        "RESULT|EnvFileExistsAtAppDirectory=$(Test-Path $envPath)"
+        "RESULT|EnvFilePath=$envPath"
+      register: workdir_check
+      changed_when: false
+
+    - name: 4/5/7 — Read deployed .env with secrets redacted (never print password/secret values)
+      check_mode: false
+      ansible.windows.win_shell: |
+        try {
+          $rawDir = ((& "{{ nssm_exe }}" get "{{ api_service_name }}" AppDirectory 2>&1) -join '')
+          $cleanDir = ($rawDir -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', '').Trim()
+          if ($cleanDir -eq '' -or -not (Test-Path -LiteralPath $cleanDir -PathType Container)) {
+            "RESULT|EnvRead=PATH_RESOLUTION_FAILED"
+          } else {
+            $envPath = Join-Path -Path $cleanDir -ChildPath '.env'
+            "RESULT|AppDirectoryUsed=$cleanDir"
+            if (-not (Test-Path -LiteralPath $envPath)) {
+              "RESULT|EnvRead=FILE_NOT_FOUND"
+            } else {
+              $lines = Get-Content -LiteralPath $envPath
+              foreach ($line in $lines) {
+                $t = $line.Trim()
+                if ($t -eq '' -or $t.StartsWith('#')) { continue }
+                $idx = $t.IndexOf('=')
+                if ($idx -lt 0) { continue }
+                $key = $t.Substring(0, $idx)
+                $val = $t.Substring($idx + 1)
+                if ($key -match '(?i)(PASSWORD|SECRET|_KEY$|TOKEN)') {
+                  if ($val -eq '') { "RESULT|$key=EMPTY" } else { "RESULT|$key=SET(length=$($val.Length))" }
+                } else {
+                  "RESULT|$key=$val"
+                }
+              }
+            }
+          }
+        } catch {
+          "RESULT|EnvRead=PATH_RESOLUTION_FAILED"
+        }
+      register: env_check
+      changed_when: false
+
+    - name: FINAL REPORT
+      ansible.builtin.debug:
+        msg:
+          - "=== 1/2 SERVICE STATE + LOG ON AS ==="
+          - "{{ svc_check.stdout_lines }}"
+          - ""
+          - "=== 3 NSSM APPLICATION/APPDIRECTORY/APPPARAMETERS ==="
+          - "{{ nssm_check.stdout_lines }}"
+          - ""
+          - "=== 6 WORKING DIRECTORY / .ENV RESOLUTION ==="
+          - "{{ workdir_check.stdout_lines }}"
+          - ""
+          - "=== 4/5 DEPLOYED .ENV (secrets redacted -- never printed) ==="
+          - "{{ env_check.stdout_lines }}"
+          - ""
+          - "=== NO CHANGES MADE -- read-only Get-Service / nssm get / Get-Content only. ==="

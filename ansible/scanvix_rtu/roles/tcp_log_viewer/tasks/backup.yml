@@ -1,0 +1,33 @@
+---
+- name: Backup timestamp
+  ansible.builtin.set_fact:
+    backup_dir: "{{ backup_root }}\\{{ ansible_date_time.iso8601_basic_short }}"
+
+- name: Create backup directory
+  ansible.windows.win_file:
+    path: "{{ backup_dir }}"
+    state: directory
+
+- name: Record SHA256 of main.py (pre-change)
+  ansible.windows.win_stat:
+    path: "{{ main_py }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: main_before
+
+- name: Back up main.py
+  ansible.windows.win_copy:
+    src: "{{ main_py }}"
+    dest: "{{ backup_dir }}\\main.py"
+    remote_src: true
+
+- name: Back up existing tcp_logs.py if present
+  ansible.windows.win_copy:
+    src: "{{ viewer_dest_dir }}\\tcp_logs.py"
+    dest: "{{ backup_dir }}\\tcp_logs.py"
+    remote_src: true
+  when: st.results[5].stat.exists
+
+- name: Backup + checksum summary
+  ansible.builtin.debug:
+    msg: "BACKUP={{ backup_dir }} MAIN_SHA256={{ main_before.stat.checksum }}"

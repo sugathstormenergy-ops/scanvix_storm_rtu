@@ -1,0 +1,280 @@
+---
+# Storm Energy RTU — Gate 2 Mosquitto Startup Diagnostic
+# READ-ONLY: Does not modify any file, service, ACL, or configuration.
+# Run with:
+#   ANSIBLE_CONFIG=ansible.cfg ANSIBLE_ROLES_PATH="$PWD/roles" \
+#   ansible-playbook -i inventory/hosts.ini playbooks/gate2_diag.yml
+#
+# No --extra-vars required — this playbook uses no credentials.
+
+- name: GATE2-DIAG | Mosquitto startup failure investigation
+  hosts: scanvix109
+  gather_facts: false
+
+  tasks:
+
+    # ── 1. Service state ──────────────────────────────────────────────────────
+    - name: DIAG | Mosquitto service state + PathName
+      ansible.windows.win_shell: |
+        $svc = Get-CimInstance Win32_Service -Filter "Name='mosquitto'"
+        if (-not $svc) {
+          Write-Output "SERVICE NOT FOUND"
+        } else {
+          Write-Output "Name      : $($svc.Name)"
+          Write-Output "State     : $($svc.State)"
+          Write-Output "Status    : $($svc.Status)"
+          Write-Output "StartMode : $($svc.StartMode)"
+          Write-Output "StartName : $($svc.StartName)"
+          Write-Output "ExitCode  : $($svc.ExitCode)"
+          Write-Output "PathName  : $($svc.PathName)"
+        }
+      register: diag_svc
+      changed_when: false
+
+    - name: DIAG | [1] Service state
+      ansible.builtin.debug:
+        var: diag_svc.stdout_lines
+
+    # ── 2. Storm config file stat ─────────────────────────────────────────────
+    - name: DIAG | Storm config file stat
+      ansible.windows.win_shell: |
+        $f = 'C:\Program Files\mosquitto\mosquitto_storm.conf'
+        if (Test-Path $f) {
+          $item = Get-Item $f
+          $acl  = Get-Acl $f
+          Write-Output "EXISTS     : YES"
+          Write-Output "Size       : $($item.Length) bytes"
+          Write-Output "Created    : $($item.CreationTime)"
+          Write-Output "Modified   : $($item.LastWriteTime)"
+          Write-Output "Owner      : $($acl.Owner)"
+          Write-Output "Access:"
+          $acl.Access | ForEach-Object {
+            Write-Output "  $($_.IdentityReference) => $($_.FileSystemRights)"
+          }
+        } else {
+          Write-Output "EXISTS     : NO"
+        }
+      register: diag_conf_stat
+      changed_when: false
+
+    - name: DIAG | [2] Storm config file stat
+      ansible.builtin.debug:
+        var: diag_conf_stat.stdout_lines
+
+    # ── 3. Storm config contents (security directives only) ───────────────────
+    - name: DIAG | Storm config contents
+      ansible.windows.win_shell: |
+        $f = 'C:\Program Files\mosquitto\mosquitto_storm.conf'
+        if (-not (Test-Path $f)) { Write-Output "FILE NOT FOUND"; exit 0 }
+        Get-Content $f | ForEach-Object { Write-Output $_ }
+      register: diag_conf_content
+      changed_when: false
+
+    - name: DIAG | [3] Storm config contents
+      ansible.builtin.debug:
+        var: diag_conf_content.stdout_lines
+
+    # ── 4. storm_passwd file stat ─────────────────────────────────────────────
+    - name: DIAG | storm_passwd file stat
+      ansible.windows.win_shell: |
+        $f = 'C:\ProgramData\StormEnergyRTU\Mosquitto\storm_passwd'
+        if (Test-Path $f) {
+          $item = Get-Item $f
+          $acl  = Get-Acl $f
+          Write-Output "EXISTS     : YES"
+          Write-Output "Size       : $($item.Length) bytes"
+          Write-Output "Owner      : $($acl.Owner)"
+          Write-Output "Access:"
+          $acl.Access | ForEach-Object {
+            Write-Output "  $($_.IdentityReference) => $($_.FileSystemRights)"
+          }
+        } else {
+          Write-Output "EXISTS     : NO"
+        }
+      register: diag_passwd_stat
+      changed_when: false
+
+    - name: DIAG | [4] storm_passwd stat (contents NOT shown)
+      ansible.builtin.debug:
+        var: diag_passwd_stat.stdout_lines
+
+    # ── 5. Service account + file access check ────────────────────────────────
+    - name: DIAG | Service account access to config and passwd files
+      ansible.windows.win_shell: |
+        $svc = Get-CimInstance Win32_Service -Filter "Name='mosquitto'"
+        $account = if ($svc) { $svc.StartName } else { "UNKNOWN" }
+        Write-Output "Service account: $account"
+        Write-Output ""
+        $files = @(
+          'C:\Program Files\mosquitto\mosquitto_storm.conf',
+          'C:\ProgramData\StormEnergyRTU\Mosquitto\storm_passwd'
+        )
+        foreach ($f in $files) {
+          Write-Output "--- $f ---"
+          if (Test-Path $f) {
+            $acl = Get-Acl $f
+            $acl.Access | ForEach-Object {
+              Write-Output "  $($_.IdentityReference) => $($_.FileSystemRights)"
+            }
+          } else {
+            Write-Output "  FILE NOT FOUND"
+          }
+        }
+      register: diag_access
+      changed_when: false
+
+    - name: DIAG | [5] Service account + file access
+      ansible.builtin.debug:
+        var: diag_access.stdout_lines
+
+    # ── 6. Mosquitto config validation (read-only, exits immediately) ─────────
+    - name: DIAG | Mosquitto config self-validation
+      ansible.windows.win_shell: |
+        # Run mosquitto with the Storm config but capture output only.
+        # mosquitto.exe does not have a --test-config flag; we use a 1-second
+        # timeout and parse stderr for startup errors without leaving a
+        # second broker running.
+        $exe  = 'C:\Program Files\Mosquitto\mosquitto.exe'
+        $conf = 'C:\Program Files\mosquitto\mosquitto_storm.conf'
+        if (-not (Test-Path $exe))  { Write-Output "mosquitto.exe not found"; exit 0 }
+        if (-not (Test-Path $conf)) { Write-Output "mosquitto_storm.conf not found"; exit 0 }
+
+        # Capture output from a short-lived broker attempt
+        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo.FileName  = $exe
+        $pinfo.Arguments = "-c `"$conf`""
+        $pinfo.RedirectStandardOutput = $true
+        $pinfo.RedirectStandardError  = $true
+        $pinfo.UseShellExecute = $false
+        $pinfo.CreateNoNewWindow = $true
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $pinfo
+        $proc.Start() | Out-Null
+
+        Start-Sleep -Milliseconds 1500
+
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+
+        if (-not $proc.HasExited) {
+          $proc.Kill()
+          Write-Output "BROKER_PROBE: started OK then killed (no config error within 1.5s)"
+        } else {
+          Write-Output "BROKER_PROBE: exited with code $($proc.ExitCode)"
+        }
+        Write-Output "STDOUT: $stdout"
+        Write-Output "STDERR: $stderr"
+      register: diag_validate
+      changed_when: false
+
+    - name: DIAG | [6] Mosquitto config validation
+      ansible.builtin.debug:
+        var: diag_validate.stdout_lines
+
+    # ── 7. Windows Event Log (last 10 errors around Mosquitto) ────────────────
+    - name: DIAG | Event log — recent Mosquitto / SCM errors
+      ansible.windows.win_shell: |
+        $after = (Get-Date).AddMinutes(-30)
+
+        # System log — Service Control Manager errors
+        $sys = Get-WinEvent -FilterHashtable @{
+          LogName   = 'System'
+          StartTime = $after
+          Level     = @(1,2,3)
+        } -ErrorAction SilentlyContinue |
+          Where-Object { $_.Message -match 'mosquitto|Mosquitto' } |
+          Select-Object -First 10
+
+        if ($sys) {
+          $sys | ForEach-Object {
+            Write-Output "[$($_.TimeCreated)] [$($_.Id)] [$($_.ProviderName)]"
+            Write-Output "  $($_.Message -replace '\r?\n',' ')"
+          }
+        } else {
+          Write-Output "System log: no Mosquitto errors in last 30 min"
+        }
+
+        # Application log
+        $app = Get-WinEvent -FilterHashtable @{
+          LogName   = 'Application'
+          StartTime = $after
+          Level     = @(1,2,3)
+        } -ErrorAction SilentlyContinue |
+          Where-Object { $_.Message -match 'mosquitto|Mosquitto' -or $_.ProviderName -match 'mosquitto' } |
+          Select-Object -First 10
+
+        if ($app) {
+          $app | ForEach-Object {
+            Write-Output "[$($_.TimeCreated)] [$($_.Id)] [$($_.ProviderName)]"
+            Write-Output "  $($_.Message -replace '\r?\n',' ')"
+          }
+        } else {
+          Write-Output "Application log: no Mosquitto errors in last 30 min"
+        }
+      register: diag_evtlog
+      changed_when: false
+
+    - name: DIAG | [7] Event log evidence
+      ansible.builtin.debug:
+        var: diag_evtlog.stdout_lines
+
+    # ── 8. Port 1883 check ────────────────────────────────────────────────────
+    - name: DIAG | Port 1883 binding
+      ansible.windows.win_shell: |
+        $conns = Get-NetTCPConnection -LocalPort 1883 -ErrorAction SilentlyContinue
+        if ($conns) {
+          $conns | ForEach-Object {
+            $proc = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+            Write-Output "$($_.LocalAddress):$($_.LocalPort)  State=$($_.State)  PID=$($_.OwningProcess)  Process=$($proc.Name)"
+          }
+        } else {
+          Write-Output "Port 1883: NOT LISTENING"
+        }
+      register: diag_port
+      changed_when: false
+
+    - name: DIAG | [8] Port 1883
+      ansible.builtin.debug:
+        var: diag_port.stdout_lines
+
+    # ── 9. Running Mosquitto processes ────────────────────────────────────────
+    - name: DIAG | Running mosquitto processes
+      ansible.windows.win_shell: |
+        $procs = Get-Process -Name mosquitto -ErrorAction SilentlyContinue
+        if ($procs) {
+          $procs | ForEach-Object {
+            Write-Output "PID=$($_.Id)  Name=$($_.ProcessName)  Path=$($_.Path)  Started=$($_.StartTime)"
+          }
+        } else {
+          Write-Output "No mosquitto process running"
+        }
+      register: diag_proc
+      changed_when: false
+
+    - name: DIAG | [9] Running mosquitto processes
+      ansible.builtin.debug:
+        var: diag_proc.stdout_lines
+
+    # ── 10. Mosquitto log file ────────────────────────────────────────────────
+    - name: DIAG | Mosquitto log (last 40 lines)
+      ansible.windows.win_shell: |
+        $logs = @(
+          'C:\Program Files\mosquitto\mosquitto_storm.log',
+          'C:\Program Files\mosquitto\mosquitto.log'
+        )
+        foreach ($log in $logs) {
+          if (Test-Path $log) {
+            Write-Output "=== $log ==="
+            Get-Content $log -Tail 40
+          }
+        }
+        if (-not ($logs | Where-Object { Test-Path $_ })) {
+          Write-Output "No mosquitto log files found at expected locations"
+        }
+      register: diag_log
+      changed_when: false
+
+    - name: DIAG | [10] Mosquitto log tail
+      ansible.builtin.debug:
+        var: diag_log.stdout_lines

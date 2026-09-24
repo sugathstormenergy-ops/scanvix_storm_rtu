@@ -1,0 +1,201 @@
+---
+# Storm Energy RTU — Verification Playbook
+# ==========================================
+# Verifies the deployed Storm Energy RTU platform.
+# Read-only checks — does NOT change anything.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini playbooks/verify.yml
+
+- name: Storm Energy RTU — Verification
+  hosts: scanvix_rtu
+  gather_facts: false
+
+  tasks:
+
+    # ── Install directory ─────────────────────────────────────────────────────
+    - name: VERIFY | Install dir — E:\StormEnergyRTU
+      ansible.windows.win_stat:
+        path: '{{ scanvix_install_dir }}'
+      register: install_dir
+      failed_when: not install_dir.stat.exists
+
+    - name: VERIFY | Install dir — app subdir
+      ansible.windows.win_stat:
+        path: '{{ scanvix_app_dir }}'
+      register: app_dir
+      failed_when: not app_dir.stat.exists
+
+    - name: VERIFY | Install dir — logs subdir
+      ansible.windows.win_stat:
+        path: '{{ scanvix_logs_dir }}'
+      register: log_dir
+      failed_when: not log_dir.stat.exists
+
+    - name: VERIFY | Install dir — .env file
+      ansible.windows.win_stat:
+        path: '{{ scanvix_config_file }}'
+      register: env_file
+      failed_when: not env_file.stat.exists
+
+    # ── Python virtual environment ────────────────────────────────────────────
+    - name: VERIFY | Venv — python.exe exists
+      ansible.windows.win_stat:
+        path: '{{ scanvix_venv_python }}'
+      register: venv_python
+      failed_when: not venv_python.stat.exists
+
+    - name: VERIFY | Venv — FastAPI importable
+      ansible.windows.win_shell: |
+        & '{{ scanvix_venv_python }}' -c "import fastapi; print('fastapi', fastapi.__version__)"
+      register: fastapi_check
+      changed_when: false
+      failed_when: fastapi_check.rc != 0
+
+    - name: VERIFY | Venv — FastAPI version
+      ansible.builtin.debug:
+        msg: "{{ fastapi_check.stdout_lines }}"
+
+    - name: VERIFY | Venv — SQLAlchemy importable
+      ansible.windows.win_shell: |
+        & '{{ scanvix_venv_python }}' -c "import sqlalchemy; print('sqlalchemy', sqlalchemy.__version__)"
+      register: sqla_check
+      changed_when: false
+      failed_when: sqla_check.rc != 0
+
+    - name: VERIFY | Venv — pyodbc importable
+      ansible.windows.win_shell: |
+        & '{{ scanvix_venv_python }}' -c "import pyodbc; print('pyodbc', pyodbc.version)"
+      register: pyodbc_check
+      changed_when: false
+      failed_when: pyodbc_check.rc != 0
+
+    # ── Windows services ──────────────────────────────────────────────────────
+    - name: VERIFY | Service — {{ scanvix_api_service_name }} running
+      ansible.windows.win_service_info:
+        name: '{{ scanvix_api_service_name }}'
+      register: api_svc_info
+      failed_when: >
+        api_svc_info.services | length == 0 or
+        api_svc_info.services[0].state != 'running'
+
+    - name: VERIFY | Service — {{ scanvix_mqtt_service_name }} running
+      ansible.windows.win_service_info:
+        name: '{{ scanvix_mqtt_service_name }}'
+      register: mqtt_svc_info
+      failed_when: >
+        mqtt_svc_info.services | length == 0 or
+        mqtt_svc_info.services[0].state != 'running'
+
+    - name: VERIFY | Service — {{ scanvix_tcp_service_name }} running
+      ansible.windows.win_service_info:
+        name: '{{ scanvix_tcp_service_name }}'
+      register: tcp_svc_info
+      failed_when: >
+        tcp_svc_info.services | length == 0 or
+        tcp_svc_info.services[0].state != 'running'
+
+    # ── Port listening ────────────────────────────────────────────────────────
+    - name: VERIFY | Port — API {{ scanvix_api_port }} listening
+      ansible.windows.win_shell: |
+        $r = netstat -ano | Select-String ':{{ scanvix_api_port }} '
+        if ($r) { "Port {{ scanvix_api_port }}: LISTENING"; exit 0 }
+        else { "Port {{ scanvix_api_port }}: NOT LISTENING"; exit 1 }
+      register: api_port_check
+      changed_when: false
+      failed_when: api_port_check.rc != 0
+
+    - name: VERIFY | Port — TCP {{ scanvix_tcp_port }} listening
+      ansible.windows.win_shell: |
+        $r = netstat -ano | Select-String ':{{ scanvix_tcp_port }} '
+        if ($r) { "Port {{ scanvix_tcp_port }}: LISTENING"; exit 0 }
+        else { "Port {{ scanvix_tcp_port }}: NOT LISTENING"; exit 1 }
+      register: tcp_port_check
+      changed_when: false
+      failed_when: tcp_port_check.rc != 0
+
+    - name: VERIFY | Port — MQTT {{ scanvix_mqtt_port }} listening
+      ansible.windows.win_shell: |
+        $r = netstat -ano | Select-String ':{{ scanvix_mqtt_port }} '
+        if ($r) { "Port {{ scanvix_mqtt_port }}: LISTENING"; exit 0 }
+        else { "Port {{ scanvix_mqtt_port }}: NOT LISTENING"; exit 1 }
+      register: mqtt_port_check
+      changed_when: false
+      failed_when: mqtt_port_check.rc != 0
+
+    # ── SQL Server connectivity ───────────────────────────────────────────────
+    - name: VERIFY | Database — STORM_ENERGY_RTU exists and accessible
+      ansible.windows.win_shell: |
+        try {
+          $conn = New-Object System.Data.SqlClient.SqlConnection
+          $conn.ConnectionString = "Server=localhost;Database={{ scanvix_database_name }};Integrated Security=True;Connect Timeout=10"
+          $conn.Open()
+          $cmd = $conn.CreateCommand()
+          $cmd.CommandText = "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+          $count = $cmd.ExecuteScalar()
+          $conn.Close()
+          "Database {{ scanvix_database_name }}: OK  Tables=$count"
+          exit 0
+        } catch {
+          Write-Error "Database check failed: $_"
+          exit 1
+        }
+      register: db_check
+      changed_when: false
+      failed_when: db_check.rc != 0
+
+    - name: VERIFY | Database — report
+      ansible.builtin.debug:
+        msg: "{{ db_check.stdout_lines }}"
+
+    # ── Firewall rules ────────────────────────────────────────────────────────
+    - name: VERIFY | Firewall — {{ scanvix_fw_api_rule }} exists
+      ansible.windows.win_shell: |
+        $r = Get-NetFirewallRule -DisplayName '{{ scanvix_fw_api_rule }}' -ErrorAction SilentlyContinue
+        if ($r) { "'{{ scanvix_fw_api_rule }}': OK  Enabled=$($r.Enabled)"; exit 0 }
+        else { "'{{ scanvix_fw_api_rule }}': MISSING"; exit 1 }
+      register: fw_api_check
+      changed_when: false
+      failed_when: fw_api_check.rc != 0
+
+    - name: VERIFY | Firewall — {{ scanvix_fw_mqtt_rule }} exists
+      ansible.windows.win_shell: |
+        $r = Get-NetFirewallRule -DisplayName '{{ scanvix_fw_mqtt_rule }}' -ErrorAction SilentlyContinue
+        if ($r) { "'{{ scanvix_fw_mqtt_rule }}': OK"; exit 0 }
+        else { "'{{ scanvix_fw_mqtt_rule }}': MISSING"; exit 1 }
+      register: fw_mqtt_check
+      changed_when: false
+      failed_when: fw_mqtt_check.rc != 0
+
+    - name: VERIFY | Firewall — {{ scanvix_fw_tcp_rule }} exists
+      ansible.windows.win_shell: |
+        $r = Get-NetFirewallRule -DisplayName '{{ scanvix_fw_tcp_rule }}' -ErrorAction SilentlyContinue
+        if ($r) { "'{{ scanvix_fw_tcp_rule }}': OK"; exit 0 }
+        else { "'{{ scanvix_fw_tcp_rule }}': MISSING"; exit 1 }
+      register: fw_tcp_check
+      changed_when: false
+      failed_when: fw_tcp_check.rc != 0
+
+    # ── Final summary ─────────────────────────────────────────────────────────
+    - name: VERIFY | SUMMARY — all checks passed
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "VERIFICATION PASSED"
+          - "============================================================"
+          - "Install dir  : OK"
+          - "Venv Python  : OK"
+          - "FastAPI      : {{ fastapi_check.stdout | trim }}"
+          - "SQLAlchemy   : {{ sqla_check.stdout | trim }}"
+          - "pyodbc       : {{ pyodbc_check.stdout | trim }}"
+          - "API service  : {{ api_svc_info.services[0].state }}"
+          - "MQTT service : {{ mqtt_svc_info.services[0].state }}"
+          - "TCP service  : {{ tcp_svc_info.services[0].state }}"
+          - "Port 8090    : {{ api_port_check.stdout | trim }}"
+          - "Port 9000    : {{ tcp_port_check.stdout | trim }}"
+          - "Port 1883    : {{ mqtt_port_check.stdout | trim }}"
+          - "Database     : {{ db_check.stdout | trim }}"
+          - "FW API rule  : OK"
+          - "FW MQTT rule : OK"
+          - "FW TCP rule  : OK"
+          - "============================================================"

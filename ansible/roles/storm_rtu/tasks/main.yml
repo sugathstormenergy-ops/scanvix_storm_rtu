@@ -1,0 +1,41 @@
+---
+- name: Deploy .env configuration (from vault)
+  ansible.builtin.template:
+    src:   env.j2
+    dest:  "{{ app_base_dir }}/backend/.env"
+    owner: "{{ app_user }}"
+    group: "{{ app_group }}"
+    mode:  "0640"
+  notify:
+    - restart storm-rtu-api
+    - restart storm-rtu-mqtt
+    - restart storm-rtu-tcp
+
+- name: Deploy systemd service — storm-rtu-api
+  ansible.builtin.template:
+    src:   storm-rtu-api.service.j2
+    dest:  /etc/systemd/system/storm-rtu-api.service
+    mode:  "0644"
+  notify: reload systemd
+
+- name: Deploy systemd service — storm-rtu-mqtt
+  ansible.builtin.template:
+    src:   storm-rtu-mqtt.service.j2
+    dest:  /etc/systemd/system/storm-rtu-mqtt.service
+    mode:  "0644"
+  notify: reload systemd
+
+- name: Deploy systemd service — storm-rtu-tcp
+  ansible.builtin.template:
+    src:   storm-rtu-tcp.service.j2
+    dest:  /etc/systemd/system/storm-rtu-tcp.service
+    mode:  "0644"
+  notify: reload systemd
+
+- name: Enable and start Storm RTU services
+  ansible.builtin.systemd:
+    name:    "{{ item }}"
+    enabled: true
+    state:   started
+  loop:
+    - storm-rtu-api

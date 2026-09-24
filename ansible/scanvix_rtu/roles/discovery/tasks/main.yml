@@ -1,0 +1,23 @@
+---
+# Storm Energy RTU — Discovery role
+# Imported by deploy.yml for pre-deployment fact gathering.
+# This role only reads — it never modifies anything.
+
+- name: DISCOVERY ROLE | Gather running services snapshot
+  ansible.windows.win_shell: |
+    Get-Service | Where-Object Status -eq Running |
+      Select-Object Name, Status | Sort-Object Name |
+      ConvertTo-Json -Compress
+  register: pre_deploy_services
+  changed_when: false
+
+- name: DISCOVERY ROLE | Gather listening ports snapshot
+  ansible.windows.win_shell: |
+    netstat -ano | Select-String 'LISTENING' | Out-String
+  register: pre_deploy_ports
+  changed_when: false
+
+- name: DISCOVERY ROLE | Store facts for later roles
+  ansible.builtin.set_fact:
+    discovery_services: "{{ pre_deploy_services.stdout }}"
+    discovery_ports:    "{{ pre_deploy_ports.stdout }}"

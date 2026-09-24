@@ -1,0 +1,296 @@
+---
+# Storm Energy RTU — Database Role
+#
+# Creates STORM_ENERGY_RTU on .\SQLEXPRESS if it does not already exist.
+# SQL scripts are sourced from the Ansible CONTROLLER at:
+#   <project_root>/database/001-004_*.sql
+# and staged to the remote host at:
+#   E:\StormEnergyRTU\scripts\database\
+# The variable scanvix_db_script_dir is preserved but NOT assumed to exist
+# as a remote path — it documents the canonical source location only.
+#
+# IDEMPOTENT: pre-existing STORM_ENERGY_RTU is verified and left untouched.
+# CHECK MODE: safe in both states; never fails because source dir is absent.
+#
+# SAFETY:
+#   - Only operates on STORM_ENERGY_RTU / .\SQLEXPRESS.
+#   - Never touches WATER_METERS, NCC_WATER_METERS, KHSCCL, or any Allipuram DB.
+#   - Never connects to 192.168.0.107 or 192.168.0.108.
+
+# ── SECTION 1: SQL Server connectivity (read-only, always runs) ─────────────
+
+- name: DATABASE | Verify SQL Server is reachable (.\SQLEXPRESS)
+  check_mode: false
+  ansible.windows.win_shell: |
+    try {
+      $conn = New-Object System.Data.SqlClient.SqlConnection
+      $conn.ConnectionString = "Server={{ scanvix_sql_instance }};Integrated Security=True;Connect Timeout=10"
+      $conn.Open()
+      $cmd = $conn.CreateCommand()
+      $cmd.CommandText = "SELECT @@VERSION"
+      $ver = $cmd.ExecuteScalar()
+      $conn.Close()
+      $ver -split "`n" | Select-Object -First 1
+    } catch {
+      Write-Error "SQL Server {{ scanvix_sql_instance }} not reachable: $_"
+      exit 1
+    }
+  register: sql_version
+  changed_when: false
+  failed_when: sql_version.rc != 0
+
+- name: DATABASE | SQL Server version
+  ansible.builtin.debug:
+    msg: "{{ sql_version.stdout_lines | default(['(SQL version check skipped)']) }}"
+
+# ── SECTION 2: Existence check (read-only, always runs) ────────────────────
+
+- name: DATABASE | Check if STORM_ENERGY_RTU already exists
+  check_mode: false
+  ansible.windows.win_shell: |
+    $conn = New-Object System.Data.SqlClient.SqlConnection
+    $conn.ConnectionString = "Server={{ scanvix_sql_instance }};Integrated Security=True;Connect Timeout=10"
+    $conn.Open()
+    $cmd = $conn.CreateCommand()
+    $cmd.CommandText = "SELECT COUNT(*) FROM sys.databases WHERE name = '{{ scanvix_database_name }}'"
+    $result = $cmd.ExecuteScalar()
+    $conn.Close()
+    $result
+  register: db_exists_check
+  changed_when: false
+  failed_when: false
+
+# ── SECTION 2B: Required-table completeness check (read-only, always runs) ──
+# Counts how many of the 8 required tables already exist. This is the gate
+# used below instead of "does the database exist" so that a database left in
+# a PARTIAL state (e.g. from the FK-ordering defect fixed in 002_tables.sql)
+# is detected and repaired on the next run, rather than being skipped forever
+# just because the database itself already exists.
+
+- name: DATABASE | Check how many required tables already exist
+  check_mode: false
+  ansible.windows.win_shell: |
+    try {
+      $conn = New-Object System.Data.SqlClient.SqlConnection
+      $conn.ConnectionString = "Server={{ scanvix_sql_instance }};Database={{ scanvix_database_name }};Integrated Security=True;Connect Timeout=10"
+      $conn.Open()
+      $cmd = $conn.CreateCommand()
+      $cmd.CommandText = "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME IN ('Devices','DeviceConfiguration','Telemetry','RawMessages','MQTTMessages','TCPMessages','DeviceCommands','DeviceEvents')"
+      $result = $cmd.ExecuteScalar()
+      $conn.Close()
+      $result
+    } catch {
+      # Database does not exist yet, or is not yet reachable by name -- treat
+      # as zero required tables present so the full 001-004 sequence runs.
+      0
+    }
+  register: table_count_check
+  changed_when: false
+  failed_when: false
+
+- name: DATABASE | Required-table count
+  ansible.builtin.debug:
+    msg: "{{ table_count_check.stdout | trim }} of 8 required tables currently exist in {{ scanvix_database_name }}"
+
+# ── SECTION 3A: Database already exists ─────────────────────────────────────
+
+- name: DATABASE | Database exists — creation skipped
+  ansible.builtin.debug:
+    msg: "{{ scanvix_database_name }} already exists -- database creation skipped"
+  when: db_exists_check.stdout | trim | int > 0
+
+# ── SECTION 3B: Database absent — check-mode notice ─────────────────────────
+
+- name: DATABASE | CHECK MODE | Database absent — would create during real run
+  ansible.builtin.debug:
+    msg:
+      - "CHECK MODE: {{ scanvix_database_name }} does not exist on {{ scanvix_sql_instance }}."
+      - "A real run (without --check) will:"
+      - "  1. Stage SQL scripts from the controller to E:\\StormEnergyRTU\\scripts\\database\\"
+      - "  2. Execute 001_database.sql through 004_constraints.sql via sqlcmd."
+      - "Skipping database creation in check mode."
+  when:
+    - ansible_check_mode
+    - db_exists_check.stdout | trim | int == 0
+
+# ── SECTION 3C: Database absent — real execution: stage then create ──────────
+# Scripts are copied FROM the controller (playbook_dir/../../../database/)
+# to a staging directory on the remote host ({{ scanvix_scripts_dir }}\database\).
+# All tasks here are gated on not ansible_check_mode so --check never reaches them.
+
+- name: DATABASE | Create SQL staging directory on remote host
+  ansible.windows.win_file:
+    path: '{{ scanvix_scripts_dir }}\database'
+    state: directory
+  when:
+    - table_count_check.stdout | trim | int < 8
+    - not ansible_check_mode
+
+- name: DATABASE | Stage 001_database.sql from controller
+  ansible.windows.win_copy:
+    src: "{{ playbook_dir }}/../../../database/001_database.sql"
+    dest: '{{ scanvix_scripts_dir }}\database\001_database.sql'
+  when:
+    - table_count_check.stdout | trim | int < 8
+    - not ansible_check_mode
+
+- name: DATABASE | Stage 002_tables.sql from controller
+  ansible.windows.win_copy:
+    src: "{{ playbook_dir }}/../../../database/002_tables.sql"
+    dest: '{{ scanvix_scripts_dir }}\database\002_tables.sql'
+  when:
+    - table_count_check.stdout | trim | int < 8
+    - not ansible_check_mode
+
+- name: DATABASE | Stage 003_indexes.sql from controller
+  ansible.windows.win_copy:
+    src: "{{ playbook_dir }}/../../../database/003_indexes.sql"
+    dest: '{{ scanvix_scripts_dir }}\database\003_indexes.sql'
+  when:
+    - table_count_check.stdout | trim | int < 8
+    - not ansible_check_mode
+
+- name: DATABASE | Stage 004_constraints.sql from controller
+  ansible.windows.win_copy:
+    src: "{{ playbook_dir }}/../../../database/004_constraints.sql"
+    dest: '{{ scanvix_scripts_dir }}\database\004_constraints.sql'
+  when:
+    - table_count_check.stdout | trim | int < 8
+    - not ansible_check_mode
+
+- name: DATABASE | Execute 001_database.sql (CREATE DATABASE)
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ scanvix_sql_instance }}" -E -C -b -i "{{ scanvix_scripts_dir }}\database\001_database.sql"
+    if ($LASTEXITCODE -ne 0) { Write-Error "001_database.sql failed (exit $LASTEXITCODE)"; exit 1 }
+    Write-Output "001_database.sql: OK"
+  register: sql001
+  changed_when: true
+  when:
+    - table_count_check.stdout | trim | int < 8
+    - not ansible_check_mode
+
+- name: DATABASE | Execute 002_tables.sql (CREATE TABLES)
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ scanvix_sql_instance }}" -E -C -b -i "{{ scanvix_scripts_dir }}\database\002_tables.sql"
+    if ($LASTEXITCODE -ne 0) { Write-Error "002_tables.sql failed (exit $LASTEXITCODE)"; exit 1 }
+    Write-Output "002_tables.sql: OK"
+  register: sql002
+  changed_when: true
+  when:
+    - table_count_check.stdout | trim | int < 8
+    - not ansible_check_mode
+
+- name: DATABASE | Execute 003_indexes.sql (CREATE INDEXES)
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ scanvix_sql_instance }}" -E -C -b -i "{{ scanvix_scripts_dir }}\database\003_indexes.sql"
+    if ($LASTEXITCODE -ne 0) { Write-Error "003_indexes.sql failed (exit $LASTEXITCODE)"; exit 1 }
+    Write-Output "003_indexes.sql: OK"
+  register: sql003
+  changed_when: true
+  when:
+    - table_count_check.stdout | trim | int < 8
+    - not ansible_check_mode
+
+- name: DATABASE | Execute 004_constraints.sql (CHECK CONSTRAINTS)
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ scanvix_sql_instance }}" -E -C -b -i "{{ scanvix_scripts_dir }}\database\004_constraints.sql"
+    if ($LASTEXITCODE -ne 0) { Write-Error "004_constraints.sql failed (exit $LASTEXITCODE)"; exit 1 }
+    Write-Output "004_constraints.sql: OK"
+  register: sql004
+  changed_when: true
+  when:
+    - table_count_check.stdout | trim | int < 8
+    - not ansible_check_mode
+
+- name: DATABASE | Verify table count after creation
+  check_mode: false
+  ansible.windows.win_shell: |
+    $conn = New-Object System.Data.SqlClient.SqlConnection
+    $conn.ConnectionString = "Server={{ scanvix_sql_instance }};Database={{ scanvix_database_name }};Integrated Security=True;Connect Timeout=10"
+    $conn.Open()
+    $cmd = $conn.CreateCommand()
+    $cmd.CommandText = "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+    $count = $cmd.ExecuteScalar()
+    $conn.Close()
+    Write-Output "{{ scanvix_database_name }} tables after creation: $count"
+  register: table_count
+  changed_when: false
+  when:
+    - table_count_check.stdout | trim | int < 8
+    - not ansible_check_mode
+
+- name: DATABASE | Table count after creation
+  ansible.builtin.debug:
+    msg: "{{ table_count.stdout_lines | default(['(table count skipped — DB already existed or check mode)']) }}"
+
+# ── SECTION 3D: Post-deployment schema completeness assertion ──────────────
+# Runs on every real (non-check-mode) invocation of this role, regardless of
+# which branch above executed, and FAILS THE PLAY if any of the 8 required
+# tables is still missing. This turns a silent partial failure (the original
+# root cause) into a loud, specific one, before database deployment is ever
+# reported as successful.
+
+- name: DATABASE | Determine which required tables are present now
+  check_mode: false
+  ansible.windows.win_shell: |
+    $conn = New-Object System.Data.SqlClient.SqlConnection
+    $conn.ConnectionString = "Server={{ scanvix_sql_instance }};Database={{ scanvix_database_name }};Integrated Security=True;Connect Timeout=10"
+    $conn.Open()
+    $cmd = $conn.CreateCommand()
+    $cmd.CommandText = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME IN ('Devices','DeviceConfiguration','Telemetry','RawMessages','MQTTMessages','TCPMessages','DeviceCommands','DeviceEvents') ORDER BY TABLE_NAME"
+    $reader = $cmd.ExecuteReader()
+    $present = @()
+    while ($reader.Read()) { $present += $reader.GetString(0) }
+    $conn.Close()
+    $present -join "`n"
+  register: schema_assert_present
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: DATABASE | Compute missing required tables
+  ansible.builtin.set_fact:
+    scanvix_required_tables:
+      - Devices
+      - DeviceConfiguration
+      - Telemetry
+      - RawMessages
+      - MQTTMessages
+      - TCPMessages
+      - DeviceCommands
+      - DeviceEvents
+    scanvix_present_tables: "{{ schema_assert_present.stdout_lines | default([]) }}"
+  when: not ansible_check_mode
+
+- name: DATABASE | FAIL if required schema is incomplete
+  ansible.builtin.fail:
+    msg: >-
+      Schema completeness check FAILED for {{ scanvix_database_name }}: missing
+      table(s): {{ scanvix_required_tables | difference(scanvix_present_tables) | join(', ') }}.
+      Present table(s): {{ scanvix_present_tables | join(', ') }}.
+      Database deployment cannot be reported successful until this is resolved.
+  when:
+    - not ansible_check_mode
+    - (scanvix_required_tables | difference(scanvix_present_tables) | length) > 0
+
+- name: DATABASE | Schema completeness check passed
+  ansible.builtin.debug:
+    msg: "All 8 required tables present in {{ scanvix_database_name }}."
+  when:
+    - not ansible_check_mode
+    - (scanvix_required_tables | difference(scanvix_present_tables) | length) == 0
+
+# ── SECTION 4: Final table listing ──────────────────────────────────────────
+# Runs when DB exists (pre-existing or just created) in real mode.
+# Skipped in check mode when DB is absent to avoid connecting to a non-existent DB.
+
+- name: DATABASE | List tables in STORM_ENERGY_RTU
+  check_mode: false
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ scanvix_sql_instance }}" -E -C -d {{ scanvix_database_name }} -Q "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME" -h -1 -W
+  register: table_list
+  changed_when: false
+  when: not ansible_check_mode or db_exists_check.stdout | trim | int > 0
+
+- name: DATABASE | Table list
+  ansible.builtin.debug:
+    msg: "{{ table_list.stdout_lines | default(['(table list skipped in check mode — database not yet created)']) }}"

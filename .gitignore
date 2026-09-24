@@ -1,0 +1,73 @@
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
+*.egg-info/
+dist/
+build/
+
+# ─── Secrets — NEVER commit these ────────────────────────────────────────────
+*.key
+*.pem
+*.p12
+*.pfx
+ca.crt
+server.crt
+ansible/group_vars/vault.yml
+.vault_pass
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ─── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Test artefacts ──────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# Staged installers (large binaries, not committed)
+installers/*.exe
+
+# ─── MQTT password database — NEVER commit ────────────────────────────────────
+storm_passwd
+**/storm_passwd
+ansible/scanvix_rtu/roles/mqtt/files/storm_passwd
+
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+*.bak
+*.backup
+
+*.db
+*.sqlite
+*.sqlite3
+
+ansible/scanvix_rtu/inventory/hosts.ini
+
+scanvix_rtu_ansible.tar.gz
+scanvix_rtu_tcp_log_viewer_additions.tar.gz

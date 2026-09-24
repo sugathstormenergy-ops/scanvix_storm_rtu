@@ -1,0 +1,129 @@
+---
+# READ-ONLY live database inspection — STORM_ENERGY_RTU.
+# Issues ONLY: SELECT @@VERSION, INFORMATION_SCHEMA.TABLES reads, and
+# SELECT COUNT(*) WITH (NOLOCK) on tables confirmed to exist.
+# NO INSERT/UPDATE/DELETE/MERGE/CREATE/ALTER/DROP/TRUNCATE anywhere in this
+# file. Does NOT run the database role. Does NOT run 001-004_*.sql. Does NOT
+# touch MQTT, ports, firewall, router, or any application file.
+#
+# Table list is authoritative from the repo's own migration files + ORM
+# models (cross-checked 002_tables.sql / 001 / 003 / 004 against
+# backend/app/database/models.py __tablename__ — exactly 8, confirmed, not
+# assumed).
+#
+#   cd /mnt/e/scanvix_RTU/storm-energy-rtu/ansible/scanvix_rtu
+#   export ANSIBLE_ROLES_PATH="$(pwd)/roles"
+#   ansible-playbook -i inventory/hosts.ini playbooks/db_readonly_inspect.yml --syntax-check
+#   ansible-playbook -i inventory/hosts.ini playbooks/db_readonly_inspect.yml
+- name: Connectivity gate
+  hosts: scanvix109
+  gather_facts: false
+  tasks: [ { ansible.windows.win_ping: {} } ]
+
+- name: READ-ONLY inspection of STORM_ENERGY_RTU
+  hosts: scanvix109
+  gather_facts: false
+  vars:
+    # Reused from inventory/group_vars/all.yml — NOT re-invented here.
+    scanvix_sql_instance:  '.\SQLEXPRESS'
+    scanvix_database_name: 'STORM_ENERGY_RTU'
+    # Authoritative required-table list (see header comment for derivation).
+    required_tables:
+      - Devices
+      - DeviceConfiguration
+      - Telemetry
+      - RawMessages
+      - MQTTMessages
+      - TCPMessages
+      - DeviceCommands
+      - DeviceEvents
+
+  tasks:
+    - name: A. SQL Server connectivity (SELECT @@VERSION only)
+      check_mode: false
+      ansible.windows.win_shell: |
+        try {
+          $conn = New-Object System.Data.SqlClient.SqlConnection
+          $conn.ConnectionString = "Server={{ scanvix_sql_instance }};Integrated Security=True;Connect Timeout=10"
+          $conn.Open()
+          $cmd = $conn.CreateCommand()
+          $cmd.CommandText = "SELECT @@VERSION"
+          $ver = $cmd.ExecuteScalar()
+          $conn.Close()
+          "CONNECTED"
+          ($ver -split "`n")[0]
+        } catch {
+          "CONNECTION_FAILED: $_"
+        }
+      register: conn_check
+      changed_when: false
+      failed_when: false
+
+    - name: Stop here (report only) if connection failed — no further queries attempted
+      ansible.builtin.debug:
+        msg: "SQL Server connection FAILED. See A above. No table checks were attempted."
+      when: "'CONNECTION_FAILED' in conn_check.stdout"
+
+    - name: B/C/D. List ALL base tables actually present, with schema (single read-only query)
+      check_mode: false
+      ansible.windows.win_shell: |
+        $conn = New-Object System.Data.SqlClient.SqlConnection
+        $conn.ConnectionString = "Server={{ scanvix_sql_instance }};Database={{ scanvix_database_name }};Integrated Security=True;Connect Timeout=10"
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_SCHEMA, TABLE_NAME"
+        $reader = $cmd.ExecuteReader()
+        while ($reader.Read()) { "$($reader.GetString(0))|$($reader.GetString(1))" }
+        $conn.Close()
+      register: all_tables
+      changed_when: false
+      when: "'CONNECTION_FAILED' not in conn_check.stdout"
+
+    - name: E. Row count for each REQUIRED table that is confirmed present (WITH NOLOCK, read-only)
+      check_mode: false
+      ansible.windows.win_shell: |
+        $present = @({% for n in (all_tables.stdout_lines | default([])) | map('regex_replace', '^dbo\|', '') | list %}"{{ n }}"{% if not loop.last %}, {% endif %}{% endfor %})
+        $table = '{{ item }}'
+        if ($present -notcontains $table) {
+          "MISSING"
+        } else {
+          try {
+            $conn = New-Object System.Data.SqlClient.SqlConnection
+            $conn.ConnectionString = "Server={{ scanvix_sql_instance }};Database={{ scanvix_database_name }};Integrated Security=True;Connect Timeout=10"
+            $conn.Open()
+            $cmd = $conn.CreateCommand()
+            $cmd.CommandText = "SELECT COUNT(*) FROM dbo.[$table] WITH (NOLOCK)"
+            $count = $cmd.ExecuteScalar()
+            $conn.Close()
+            "EXISTS|$count"
+          } catch {
+            "EXISTS|ERROR: $_"
+          }
+        }
+      loop: "{{ required_tables }}"
+      register: table_status
+      changed_when: false
+      when: "'CONNECTION_FAILED' not in conn_check.stdout"
+
+    - name: FINAL REPORT
+      ansible.builtin.debug:
+        msg:
+          - "=== A. LIVE DATABASE CONNECTION ==="
+          - "SQL Server instance : {{ scanvix_sql_instance }} (DESKTOP-FL70N9E\\SQLEXPRESS)"
+          - "Database            : {{ scanvix_database_name }}"
+          - "Connection result   : {{ 'SUCCESS' if 'CONNECTION_FAILED' not in conn_check.stdout else 'FAILED' }}"
+          - "{{ conn_check.stdout_lines }}"
+          - ""
+          - "=== B/D/E. REQUIRED TABLE INVENTORY (TABLE NAME | EXISTS | ROW COUNT) ==="
+          - "{% for r in (table_status.results | default([])) %}{{ r.item }} | {{ 'YES' if 'EXISTS' in r.stdout else 'NO' }} | {{ (r.stdout.split('|')[1] if 'EXISTS' in r.stdout else 'N/A - table does not exist') }}\n{% endfor %}"
+          - ""
+          - "=== C. MISSING REQUIRED TABLES ==="
+          - "{{ (table_status.results | default([])) | selectattr('stdout', 'equalto', 'MISSING') | map(attribute='item') | list }}"
+          - ""
+          - "=== D. DeviceEvents STATUS (the most important result) ==="
+          - "{% for r in (table_status.results | default([])) %}{% if r.item == 'DeviceEvents' %}dbo.DeviceEvents EXISTS: {{ 'YES' if 'EXISTS' in r.stdout else 'NO' }}{% if 'EXISTS' in r.stdout %} (row count: {{ r.stdout.split('|')[1] }}){% endif %}{% endif %}{% endfor %}"
+          - ""
+          - "=== ALL TABLES ACTUALLY PRESENT (for reference, beyond the required 8) ==="
+          - "{{ all_tables.stdout_lines | default(['(skipped — connection failed)']) }}"
+          - ""
+          - "=== G. NO DATABASE CHANGES MADE — this play issued SELECT statements only ==="

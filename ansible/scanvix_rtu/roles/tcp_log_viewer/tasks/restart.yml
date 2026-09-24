@@ -1,0 +1,23 @@
+---
+- name: Restart ONLY the StormEnergyRTU-API service
+  ansible.windows.win_command: "\"{{ nssm_exe }}\" restart {{ service_name }}"
+  register: restarted
+
+- name: Wait for Running
+  ansible.windows.win_shell: "(Get-Service '{{ service_name }}').Status"
+  changed_when: false
+  register: svc
+  retries: 6
+  delay: 5
+  until: svc.stdout is search('Running')
+
+- name: On failure, tail logs and stop (no repeated restarts)
+  when: svc.stdout is not search('Running')
+  block:
+    - ansible.windows.win_shell: |
+        if (Test-Path '{{ logs_dir }}\api_stderr.log') { "=== stderr ==="; Get-Content '{{ logs_dir }}\api_stderr.log' -Tail 40 }
+        if (Test-Path '{{ logs_dir }}\api_stdout.log') { "=== stdout ==="; Get-Content '{{ logs_dir }}\api_stdout.log' -Tail 40 }
+      changed_when: false
+      register: svc_logs
+    - ansible.builtin.fail:
+        msg: "Service did not reach Running:\n{{ svc_logs.stdout }}"

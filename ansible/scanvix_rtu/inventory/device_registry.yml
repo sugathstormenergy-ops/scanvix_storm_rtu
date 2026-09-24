@@ -1,0 +1,63 @@
+# Storm Energy RTU — Device registry (Phase 4 design, EXAMPLE ONLY)
+#
+# NOT under inventory/group_vars/, so NOT auto-loaded by any playbook run
+# (Ansible only auto-loads group_vars/*.yml and host_vars/*.yml). This
+# file must be explicitly `-e @inventory/device_registry.yml`'d or
+# `vars_files`'d by a future, explicitly-authorized phase before it has
+# any effect. It exists purely to demonstrate the intended shape of a
+# production device registry.
+#
+# CONTAINS NO PASSWORDS. Credentials live only in
+# scanvix_mqtt_device_passwd_file on scanvix109 (once Phase 5+ actually
+# provisions them) and in the controller-side secrets directory the
+# `password` lookup writes to (scanvix_mqtt_secrets_dir) -- never here,
+# never in Git.
+#
+# Fields tracked per device (Phase 4 report item I):
+#   device_id          -- 15-digit Scanvix IMEI, the source of truth for
+#                          username/topic derivation. Validated by
+#                          app.protocol.device_identity / the
+#                          device_credentials.yml assert before any
+#                          device reaches this list in a real workflow.
+#   username            -- derived, "rtu_<device_id>" (recorded here too,
+#                          only to make the registry self-describing and
+#                          human-reviewable; the ACL template does not
+#                          re-derive it, it trusts this field).
+#   topic_root          -- derived, "storm/meters/<device_id>".
+#   label                -- free-text, human-readable identifier (site
+#                          name, meter serial, etc.) -- OPTIONAL, project
+#                          convenience field, not vendor-specified.
+#   enabled              -- whether storm_acl.j2 should currently render a
+#                          stanza for this device. A device can exist in
+#                          the registry (credential provisioned) while
+#                          being temporarily disabled (ACL access
+#                          revoked) without deleting its row -- e.g. for a
+#                          decommissioned or suspended unit.
+#   credential_status    -- one of: "not_provisioned", "provisioned",
+#                          "revoked". Tracks whether
+#                          device_credentials.yml has been run for this
+#                          device_id -- informational only in this
+#                          example; nothing currently reads this field
+#                          programmatically.
+#   provisioned_date      -- ISO-8601 date, informational only.
+#
+# EXAMPLE DATA (fictitious IMEIs, matching the Phase 4 spec's own example
+# device 864012049873321 plus one additional device for isolation
+# demonstration purposes):
+
+scanvix_mqtt_devices:
+  - device_id: "864012049873321"
+    username: "rtu_864012049873321"
+    topic_root: "storm/meters/864012049873321"
+    label: "Example RTU #1 (Phase 4 spec example device)"
+    enabled: true
+    credential_status: "not_provisioned"
+    provisioned_date: null
+
+  - device_id: "864012049873322"
+    username: "rtu_864012049873322"
+    topic_root: "storm/meters/864012049873322"
+    label: "Example RTU #2 (isolation demonstration only)"
+    enabled: true
+    credential_status: "not_provisioned"
+    provisioned_date: null

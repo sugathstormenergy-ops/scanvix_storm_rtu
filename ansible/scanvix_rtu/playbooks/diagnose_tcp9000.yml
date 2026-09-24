@@ -1,0 +1,136 @@
+---
+# READ-ONLY TCP:9000 receipt diagnosis for scanvix109. Changes NOTHING:
+# only queries service/port/firewall/log state and (optionally) captures a few
+# packets on 9000. No app/parser/firewall/NAT/service/RTU changes.
+#
+# Run on WSL:
+#   cd /mnt/e/scanvix_RTU/storm-energy-rtu/ansible/scanvix_rtu
+#   export ANSIBLE_ROLES_PATH="$(pwd)/roles"
+#   ansible-playbook -i inventory/hosts.ini playbooks/diagnose_tcp9000.yml
+#   # to also capture packets while the vendor sends ONE test packet:
+#   ansible-playbook -i inventory/hosts.ini playbooks/diagnose_tcp9000.yml -e do_capture=true -e capture_seconds=60
+- name: Connectivity gate
+  hosts: scanvix109
+  gather_facts: false
+  tasks: [ { ansible.windows.win_ping: {} } ]
+
+- name: Read-only TCP :9000 receipt diagnosis
+  hosts: scanvix109
+  gather_facts: false
+  vars:
+    service_name: 'StormEnergyRTU-API'
+    logs_dir: 'E:\StormEnergyRTU\logs'
+    tcp_port: 9000
+    do_capture: false          # set true (with -e) to run a short pktmon capture
+    capture_seconds: 60
+  tasks:
+
+    # (1) service state
+    - name: "1. Service state"
+      ansible.windows.win_shell: "Get-Service '{{ service_name }}' | Select-Object Status,Name,StartType | Format-List"
+      changed_when: false
+      register: r1
+
+    # (2)+(3) listener, owning PID, and bind address (0.0.0.0 vs 127.0.0.1)
+    - name: "2-3. Listener on 9000 + owning process + bind address"
+      ansible.windows.win_shell: |
+        $l = Get-NetTCPConnection -State Listen -LocalPort {{ tcp_port }} -ErrorAction SilentlyContinue
+        if (-not $l) { "NO LISTENER ON {{ tcp_port }}" }
+        foreach ($c in $l) {
+          $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
+          "LISTEN LocalAddress=$($c.LocalAddress) LocalPort=$($c.LocalPort) PID=$($c.OwningProcess) Proc=$($p.ProcessName) Path=$($p.Path)"
+        }
+        "--- netstat cross-check ---"
+        netstat -ano | Select-String ":{{ tcp_port }}\s"
+      changed_when: false
+      register: r23
+
+    # (4) firewall rules affecting inbound 9000
+    - name: "4. Firewall rules touching 9000 (inbound)"
+      ansible.windows.win_shell: |
+        "PROFILES:"; (Get-NetFirewallProfile | Select-Object Name,Enabled | Format-Table | Out-String)
+        "PORT-9000 RULES:"
+        $f = Get-NetFirewallPortFilter -Protocol TCP | Where-Object { $_.LocalPort -eq {{ tcp_port }} -or $_.LocalPort -eq 'Any' }
+        foreach ($pf in $f) {
+          $r = $pf | Get-NetFirewallRule -ErrorAction SilentlyContinue
+          if ($r -and $r.Direction -eq 'Inbound') {
+            "RULE '$($r.DisplayName)' Enabled=$($r.Enabled) Action=$($r.Action) Profile=$($r.Profile) LocalPort=$($pf.LocalPort)"
+          }
+        }
+      changed_when: false
+      register: r4
+
+    # (5) local IP configuration (no secrets)
+    - name: "5. Local IP config (interfaces/gateway)"
+      ansible.windows.win_shell: |
+        Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -ne '127.0.0.1'} | Select-Object IPAddress,InterfaceAlias | Format-Table | Out-String
+        "DEFAULT ROUTE:"; (Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object NextHop,InterfaceAlias | Format-Table | Out-String)
+      changed_when: false
+      register: r5
+
+    # (6) currently established/attempted connections on 9000 (external IPs?)
+    - name: "6. Established/other connections on 9000 (any external RemoteAddress?)"
+      ansible.windows.win_shell: |
+        $c = Get-NetTCPConnection -LocalPort {{ tcp_port }} -ErrorAction SilentlyContinue |
+             Where-Object { $_.State -ne 'Listen' }
+        if (-not $c) { "NO NON-LISTEN CONNECTIONS ON {{ tcp_port }} RIGHT NOW" }
+        $c | Select-Object State,LocalAddress,LocalPort,RemoteAddress,RemotePort,OwningProcess | Format-Table | Out-String
+      changed_when: false
+      register: r6
+
+    # (7) recent Storm API logs mentioning TCP/connection/9000
+    - name: "7. Recent app logs referencing TCP/connection"
+      ansible.windows.win_shell: |
+        foreach ($n in @('api_stdout.log','api_stderr.log')) {
+          $p = Join-Path '{{ logs_dir }}' $n
+          "==== $n (last 60, filtered) ===="
+          if (Test-Path $p) {
+            Get-Content $p -Tail 400 | Select-String -Pattern 'TCP|connect|9000|accept|client|peer|remote' | Select-Object -Last 60
+          } else { "MISSING: $p" }
+        }
+      changed_when: false
+      register: r7
+
+    # decisive: has Windows itself seen inbound attempts recently?
+    - name: "6b. Per-connection stats + any SYN backlog hints"
+      ansible.windows.win_shell: |
+        "TCP CONNECTIONS BY STATE:"; (Get-NetTCPConnection | Group-Object State | Select-Object Name,Count | Format-Table | Out-String)
+        "PKTMON AVAILABLE:"; (Get-Command pktmon -ErrorAction SilentlyContinue | Select-Object -Expand Source)
+      changed_when: false
+      register: r6b
+
+    # (optional) SHORT read-only packet capture on 9000 using built-in pktmon
+    - name: "8. Short packet capture on 9000 (opt-in; requires -e do_capture=true)"
+      when: do_capture | bool
+      block:
+        - name: Start pktmon filtered to port 9000
+          ansible.windows.win_shell: |
+            pktmon filter remove | Out-Null
+            pktmon filter add StormRTU9000 -p {{ tcp_port }} | Out-Null
+            pktmon start --capture --pkt-size 128 -f "$env:TEMP\storm9000.etl" 2>&1 | Out-String
+          register: cap_start
+        - name: "Capturing — have the vendor send ONE test packet now"
+          ansible.builtin.pause: { seconds: "{{ capture_seconds | int }}" }
+        - name: Stop capture + summarise
+          ansible.windows.win_shell: |
+            pktmon stop 2>&1 | Out-String
+            "=== pktmon counters (packets seen on filtered port) ==="
+            pktmon counters 2>&1 | Out-String
+          register: cap_stop
+        - name: Remove the temporary capture filter (leave no state behind)
+          ansible.windows.win_shell: "pktmon filter remove | Out-Null; 'filter removed'"
+          register: cap_clean
+        - ansible.builtin.debug:
+            msg: "{{ (cap_start.stdout|default('')) ~ '\n' ~ (cap_stop.stdout|default('')) ~ '\n' ~ (cap_clean.stdout|default('')) }}"
+
+    - name: "==== DIAGNOSIS EVIDENCE ===="
+      ansible.builtin.debug:
+        msg:
+          - "1 SERVICE:              {{ r1.stdout_lines | reject('equalto','') | list }}"
+          - "2-3 LISTENER/PID/BIND:  {{ r23.stdout_lines | reject('equalto','') | list }}"
+          - "4 FIREWALL:             {{ r4.stdout_lines | reject('equalto','') | list }}"
+          - "5 LOCAL IP/ROUTE:       {{ r5.stdout_lines | reject('equalto','') | list }}"
+          - "6 CONNECTIONS ON 9000:  {{ r6.stdout_lines | reject('equalto','') | list }}"
+          - "6b STATES/PKTMON:       {{ r6b.stdout_lines | reject('equalto','') | list }}"
+          - "7 APP LOGS:             {{ r7.stdout_lines | reject('equalto','') | list }}"
+          - "READ THE GUIDE BELOW to map this evidence to failure bucket A-G."

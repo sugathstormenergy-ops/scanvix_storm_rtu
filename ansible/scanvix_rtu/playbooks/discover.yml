@@ -1,0 +1,368 @@
+---
+# Storm Energy RTU — Discovery Playbook
+# ======================================
+# READ-ONLY. Safe to run repeatedly.
+# Does NOT install, stop, restart, or modify ANYTHING.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini playbooks/discover.yml
+#
+# Inspects 192.168.0.109 and reports current state before any deployment.
+
+- name: Storm Energy RTU — Server Discovery (read-only)
+  hosts: scanvix_rtu
+  gather_facts: true
+  vars:
+    report_separator: "{{ '=' * 60 }}"
+
+  tasks:
+
+    # ── System identity ───────────────────────────────────────────────────────
+    - name: DISCOVERY | System — hostname and OS
+      ansible.builtin.debug:
+        msg:
+          - "{{ report_separator }}"
+          - "SYSTEM IDENTITY"
+          - "{{ report_separator }}"
+          - "Hostname        : {{ ansible_facts['hostname'] }}"
+          - "FQDN            : {{ ansible_facts['fqdn'] }}"
+          - "OS              : {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+          - "OS Build        : {{ ansible_facts['os_family'] }}"
+          - "Architecture    : {{ ansible_facts['architecture'] }}"
+          - "Total RAM (MB)  : {{ ansible_facts['memtotal_mb'] }}"
+
+    # ── Disk space ────────────────────────────────────────────────────────────
+    - name: DISCOVERY | Disk — all drives
+      ansible.windows.win_shell: |
+        Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{N='UsedGB';E={[math]::Round($_.Used/1GB,2)}}, @{N='FreeGB';E={[math]::Round($_.Free/1GB,2)}} | Format-Table -AutoSize | Out-String
+      register: disk_info
+      changed_when: false
+
+    - name: DISCOVERY | Disk — report
+      ansible.builtin.debug:
+        msg: "{{ disk_info.stdout_lines }}"
+
+    - name: DISCOVERY | E-drive — check existence
+      ansible.windows.win_stat:
+        path: 'E:\'
+      register: edrive_stat
+
+    - name: DISCOVERY | E-drive — report
+      ansible.builtin.debug:
+        msg: "E: drive exists: {{ edrive_stat.stat.exists }}"
+
+    - name: DISCOVERY | E-drive — StormEnergyRTU directory check
+      ansible.windows.win_stat:
+        path: 'E:\StormEnergyRTU'
+      register: storm_dir_stat
+
+    - name: DISCOVERY | E-drive — existing StormEnergyRTU
+      ansible.builtin.debug:
+        msg: "E:\\StormEnergyRTU exists: {{ storm_dir_stat.stat.exists }}"
+
+    - name: DISCOVERY | E-drive — scanvix source directory check
+      ansible.windows.win_stat:
+        path: 'E:\scanvix_RTU\storm-energy-rtu'
+      register: source_dir_stat
+
+    - name: DISCOVERY | E-drive — scanvix source directory
+      ansible.builtin.debug:
+        msg: "E:\\scanvix_RTU\\storm-energy-rtu exists: {{ source_dir_stat.stat.exists }}"
+
+    # ── Python ────────────────────────────────────────────────────────────────
+    - name: DISCOVERY | Python — enumerate all installations
+      ansible.windows.win_shell: |
+        $results = @()
+        # Check PATH python
+        try { $v = & python --version 2>&1; $results += "PATH python   : $v" } catch { $results += "PATH python   : NOT FOUND" }
+        try { $v = & python3 --version 2>&1; $results += "PATH python3  : $v" } catch { $results += "PATH python3  : NOT FOUND" }
+        # Check common install paths
+        $paths = @('C:\Python39','C:\Python310','C:\Python311','C:\Python312','C:\Python313','C:\Python314',
+                   'C:\Program Files\Python39','C:\Program Files\Python310','C:\Program Files\Python311',
+                   'C:\Program Files\Python312','C:\Program Files\Python313','C:\Program Files\Python314',
+                   'C:\Users\svc_ansible\AppData\Local\Programs\Python\Python39',
+                   'C:\Users\svc_ansible\AppData\Local\Programs\Python\Python310',
+                   'C:\Users\svc_ansible\AppData\Local\Programs\Python\Python311',
+                   'C:\Users\svc_ansible\AppData\Local\Programs\Python\Python312',
+                   'C:\Users\svc_ansible\AppData\Local\Programs\Python\Python313',
+                   'C:\Users\svc_ansible\AppData\Local\Programs\Python\Python314')
+        foreach ($p in $paths) {
+          if (Test-Path "$p\python.exe") {
+            $v = & "$p\python.exe" --version 2>&1
+            $results += "Found         : $p\python.exe  ($v)"
+          }
+        }
+        # py launcher
+        try { $v = & py --version 2>&1; $results += "py launcher   : $v" } catch {}
+        $results | ForEach-Object { $_ }
+      register: python_info
+      changed_when: false
+
+    - name: DISCOVERY | Python — report
+      ansible.builtin.debug:
+        msg: "{{ python_info.stdout_lines }}"
+
+    - name: DISCOVERY | Python — pip version
+      ansible.windows.win_shell: |
+        try { & python -m pip --version 2>&1 } catch { "pip: NOT AVAILABLE" }
+      register: pip_info
+      changed_when: false
+
+    - name: DISCOVERY | Python — pip report
+      ansible.builtin.debug:
+        msg: "{{ pip_info.stdout_lines }}"
+
+    # ── ODBC Drivers ──────────────────────────────────────────────────────────
+    - name: DISCOVERY | ODBC — installed drivers
+      ansible.windows.win_shell: |
+        Get-OdbcDriver | Select-Object Name, Platform | Sort-Object Name | Format-Table -AutoSize | Out-String
+      register: odbc_info
+      changed_when: false
+
+    - name: DISCOVERY | ODBC — report
+      ansible.builtin.debug:
+        msg: "{{ odbc_info.stdout_lines }}"
+
+    # ── SQL Server ────────────────────────────────────────────────────────────
+    - name: DISCOVERY | SQL Server — service status
+      ansible.windows.win_shell: |
+        Get-Service | Where-Object { $_.Name -like 'MSSQL*' -or $_.DisplayName -like '*SQL Server*' } |
+          Select-Object Name, DisplayName, Status | Format-Table -AutoSize | Out-String
+      register: sql_svc_info
+      changed_when: false
+
+    - name: DISCOVERY | SQL Server — service report
+      ansible.builtin.debug:
+        msg: "{{ sql_svc_info.stdout_lines }}"
+
+    - name: DISCOVERY | SQL Server — list databases
+      ansible.windows.win_shell: |
+        try {
+          $conn = New-Object System.Data.SqlClient.SqlConnection
+          $conn.ConnectionString = "Server=localhost;Integrated Security=True;Connect Timeout=5"
+          $conn.Open()
+          $cmd = $conn.CreateCommand()
+          $cmd.CommandText = "SELECT name, state_desc, create_date FROM sys.databases ORDER BY name"
+          $rdr = $cmd.ExecuteReader()
+          $results = @()
+          while ($rdr.Read()) { $results += "  $($rdr['name'])  state=$($rdr['state_desc'])  created=$($rdr['create_date'])" }
+          $conn.Close()
+          $results
+        } catch {
+          "SQL Server connection failed: $_"
+        }
+      register: sql_db_info
+      changed_when: false
+
+    - name: DISCOVERY | SQL Server — database list report
+      ansible.builtin.debug:
+        msg: "{{ sql_db_info.stdout_lines }}"
+
+    - name: DISCOVERY | SQL Server — STORM_ENERGY_RTU exists?
+      ansible.windows.win_shell: |
+        try {
+          $conn = New-Object System.Data.SqlClient.SqlConnection
+          $conn.ConnectionString = "Server=localhost;Integrated Security=True;Connect Timeout=5"
+          $conn.Open()
+          $cmd = $conn.CreateCommand()
+          $cmd.CommandText = "SELECT COUNT(*) FROM sys.databases WHERE name = 'STORM_ENERGY_RTU'"
+          $result = $cmd.ExecuteScalar()
+          $conn.Close()
+          if ($result -gt 0) { "STORM_ENERGY_RTU: EXISTS" } else { "STORM_ENERGY_RTU: DOES NOT EXIST" }
+        } catch {
+          "SQL check failed: $_"
+        }
+      register: storm_db_check
+      changed_when: false
+
+    - name: DISCOVERY | SQL Server — STORM_ENERGY_RTU status
+      ansible.builtin.debug:
+        msg: "{{ storm_db_check.stdout_lines }}"
+
+    # ── Mosquitto ─────────────────────────────────────────────────────────────
+    - name: DISCOVERY | Mosquitto — service check
+      ansible.windows.win_shell: |
+        $svc = Get-Service -Name 'mosquitto' -ErrorAction SilentlyContinue
+        if ($svc) {
+          "Mosquitto service: Name=$($svc.Name)  Status=$($svc.Status)  StartType=$($svc.StartType)"
+        } else {
+          "Mosquitto service: NOT INSTALLED"
+        }
+      register: mosquitto_svc
+      changed_when: false
+
+    - name: DISCOVERY | Mosquitto — service report
+      ansible.builtin.debug:
+        msg: "{{ mosquitto_svc.stdout_lines }}"
+
+    - name: DISCOVERY | Mosquitto — binary location
+      ansible.windows.win_shell: |
+        $paths = @('C:\Program Files\mosquitto\mosquitto.exe',
+                   'C:\mosquitto\mosquitto.exe',
+                   'C:\tools\mosquitto\mosquitto.exe')
+        $found = $false
+        foreach ($p in $paths) {
+          if (Test-Path $p) { "Mosquitto binary: $p"; $found = $true }
+        }
+        if (-not $found) { "Mosquitto binary: NOT FOUND in common paths" }
+        try {
+          $loc = Get-Command mosquitto -ErrorAction Stop
+          "Mosquitto on PATH: $($loc.Source)"
+        } catch {
+          "Mosquitto not on PATH"
+        }
+      register: mosquitto_bin
+      changed_when: false
+
+    - name: DISCOVERY | Mosquitto — binary report
+      ansible.builtin.debug:
+        msg: "{{ mosquitto_bin.stdout_lines }}"
+
+    # ── Listening ports ───────────────────────────────────────────────────────
+    - name: DISCOVERY | Ports — all listening TCP ports
+      ansible.windows.win_shell: |
+        netstat -ano | Select-String 'LISTENING' | ForEach-Object {
+          $parts = $_ -split '\s+'
+          [PSCustomObject]@{ LocalAddress=$parts[1]; PID=$parts[4] }
+        } | Sort-Object LocalAddress | Format-Table -AutoSize | Out-String
+      register: ports_info
+      changed_when: false
+
+    - name: DISCOVERY | Ports — listening report
+      ansible.builtin.debug:
+        msg: "{{ ports_info.stdout_lines }}"
+
+    - name: DISCOVERY | Ports — port 8088 status
+      ansible.windows.win_shell: |
+        $result = netstat -ano | Select-String ':8088'
+        if ($result) { "Port 8088: IN USE"; $result } else { "Port 8088: FREE" }
+      register: port_8088
+      changed_when: false
+
+    - name: DISCOVERY | Ports — 8088 report
+      ansible.builtin.debug:
+        msg: "{{ port_8088.stdout_lines }}"
+
+    - name: DISCOVERY | Ports — port 8090 status (Storm API target)
+      ansible.windows.win_shell: |
+        $result = netstat -ano | Select-String ':8090'
+        if ($result) { "Port 8090: IN USE (CONFLICT - resolve before deploying Storm API)"; $result } else { "Port 8090: FREE" }
+      register: port_8090
+      changed_when: false
+
+    - name: DISCOVERY | Ports — 8090 report
+      ansible.builtin.debug:
+        msg: "{{ port_8090.stdout_lines }}"
+
+    - name: DISCOVERY | Ports — port 1883 status (MQTT)
+      ansible.windows.win_shell: |
+        $result = netstat -ano | Select-String ':1883'
+        if ($result) { "Port 1883: IN USE"; $result } else { "Port 1883: FREE" }
+      register: port_1883
+      changed_when: false
+
+    - name: DISCOVERY | Ports — 1883 report
+      ansible.builtin.debug:
+        msg: "{{ port_1883.stdout_lines }}"
+
+    - name: DISCOVERY | Ports — port 9000 status (Storm TCP target)
+      ansible.windows.win_shell: |
+        $result = netstat -ano | Select-String ':9000'
+        if ($result) { "Port 9000: IN USE (CONFLICT - confirm TCP port with Scanvix)"; $result } else { "Port 9000: FREE" }
+      register: port_9000
+      changed_when: false
+
+    - name: DISCOVERY | Ports — 9000 report
+      ansible.builtin.debug:
+        msg: "{{ port_9000.stdout_lines }}"
+
+    # ── Windows services ──────────────────────────────────────────────────────
+    - name: DISCOVERY | Services — all running services
+      ansible.windows.win_shell: |
+        Get-Service | Where-Object { $_.Status -eq 'Running' } |
+          Select-Object Name, DisplayName, Status | Sort-Object Name |
+          Format-Table -AutoSize | Out-String
+      register: running_svcs
+      changed_when: false
+
+    - name: DISCOVERY | Services — running services report
+      ansible.builtin.debug:
+        msg: "{{ running_svcs.stdout_lines }}"
+
+    - name: DISCOVERY | Services — Allipuram/PFCMD related services
+      ansible.windows.win_shell: |
+        $keywords = @('allipuram','pfcmd','water','meter','ncc','storm','rtu')
+        $found = @()
+        foreach ($kw in $keywords) {
+          Get-Service | Where-Object { $_.Name -like "*$kw*" -or $_.DisplayName -like "*$kw*" } |
+            ForEach-Object { $found += "[$kw] Name=$($_.Name)  Display=$($_.DisplayName)  Status=$($_.Status)" }
+        }
+        if ($found.Count -eq 0) { "No Allipuram/PFCMD/Storm services found" } else { $found }
+      register: allipuram_svcs
+      changed_when: false
+
+    - name: DISCOVERY | Services — Allipuram/PFCMD report
+      ansible.builtin.debug:
+        msg: "{{ allipuram_svcs.stdout_lines }}"
+
+    - name: DISCOVERY | Services — Storm services already exist?
+      ansible.windows.win_shell: |
+        $names = @('StormEnergyRTU-API','StormEnergyRTU-MQTT','StormEnergyRTU-TCP')
+        foreach ($n in $names) {
+          $svc = Get-Service -Name $n -ErrorAction SilentlyContinue
+          if ($svc) { "$n : EXISTS  Status=$($svc.Status)" } else { "$n : NOT INSTALLED" }
+        }
+      register: storm_svcs
+      changed_when: false
+
+    - name: DISCOVERY | Services — Storm services report
+      ansible.builtin.debug:
+        msg: "{{ storm_svcs.stdout_lines }}"
+
+    # ── Firewall rules ────────────────────────────────────────────────────────
+    - name: DISCOVERY | Firewall — Storm rules already exist?
+      ansible.windows.win_shell: |
+        $rules = @('StormEnergyRTU-API-8090','StormEnergyRTU-MQTT','StormEnergyRTU-TCP')
+        foreach ($r in $rules) {
+          $rule = Get-NetFirewallRule -DisplayName $r -ErrorAction SilentlyContinue
+          if ($rule) { "FW Rule '$r': EXISTS  Enabled=$($rule.Enabled)  Direction=$($rule.Direction)" }
+          else { "FW Rule '$r': NOT FOUND" }
+        }
+      register: fw_rules
+      changed_when: false
+
+    - name: DISCOVERY | Firewall — Storm rules report
+      ansible.builtin.debug:
+        msg: "{{ fw_rules.stdout_lines }}"
+
+    # ── Virtual environment ───────────────────────────────────────────────────
+    - name: DISCOVERY | Venv — StormEnergyRTU.venv check
+      ansible.windows.win_stat:
+        path: 'E:\StormEnergyRTU.venv\Scripts\python.exe'
+      register: venv_stat
+
+    - name: DISCOVERY | Venv — report
+      ansible.builtin.debug:
+        msg: "E:\\StormEnergyRTU.venv exists: {{ venv_stat.stat.exists }}"
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    - name: DISCOVERY | SUMMARY
+      ansible.builtin.debug:
+        msg:
+          - "{{ report_separator }}"
+          - "DISCOVERY COMPLETE — NO CHANGES MADE"
+          - "{{ report_separator }}"
+          - "Host             : {{ ansible_facts['hostname'] }} ({{ ansible_host }})"
+          - "Storm source     : {{ source_dir_stat.stat.exists }}"
+          - "StormEnergyRTU/  : {{ storm_dir_stat.stat.exists }}"
+          - "Venv ready       : {{ venv_stat.stat.exists }}"
+          - "STORM_ENERGY_RTU : {{ storm_db_check.stdout | trim }}"
+          - "Port 8088        : {{ port_8088.stdout | trim }}"
+          - "Port 8090        : {{ port_8090.stdout | trim }}"
+          - "Port 1883        : {{ port_1883.stdout | trim }}"
+          - "Port 9000        : {{ port_9000.stdout | trim }}"
+          - "Mosquitto svc    : {{ mosquitto_svc.stdout | trim }}"
+          - "Storm svcs       : {{ storm_svcs.stdout_lines }}"
+          - "{{ report_separator }}"
+          - "NEXT STEP: Review output, then run deploy.yml when ready."
+          - "{{ report_separator }}"
