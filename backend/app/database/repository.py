@@ -39,6 +39,43 @@ class DeviceRepository:
         return list(db.scalars(select(Device).where(Device.IsActive == True)))
 
     @staticmethod
+    def list_with_latest_telemetry_stmt(dialect_name: str = ""):
+        """
+        ONE read-only statement returning (Device, Telemetry | None) for EVERY device
+        (active and inactive), ordered by DeviceId. "Latest" = greatest Timestamp,
+        ties broken by the greatest Id.
+
+        Same SQL on every dialect (so the unit tests exercise the production statement):
+          ... FROM Devices LEFT OUTER JOIN Telemetry
+                ON Telemetry.Id = (SELECT TOP 1 Id FROM Telemetry t2
+                                   WHERE t2.DeviceId = Devices.DeviceId
+                                   ORDER BY t2.Timestamp DESC, t2.Id DESC)
+        On SQL Server the correlated TOP 1 is an index seek per device on
+        IX_Telemetry_Device_Ts (DeviceId, Timestamp DESC) followed by a clustered-key
+        lookup, so the cost does not grow with the size of the Telemetry table.
+        """
+        from sqlalchemy.orm import aliased
+        t2 = aliased(Telemetry, name="t_latest")
+        latest_id = (
+            select(t2.Id)
+            .where(t2.DeviceId == Device.DeviceId)
+            .order_by(t2.Timestamp.desc(), t2.Id.desc())
+            .limit(1)
+            .correlate(Device)
+            .scalar_subquery()
+        )
+        return (
+            select(Device, Telemetry)
+            .outerjoin(Telemetry, Telemetry.Id == latest_id)
+            .order_by(Device.DeviceId)
+        )
+
+    @staticmethod
+    def list_with_latest_telemetry(db: Session):
+        stmt = DeviceRepository.list_with_latest_telemetry_stmt(db.get_bind().dialect.name)
+        return [(row[0], row[1]) for row in db.execute(stmt).all()]
+
+    @staticmethod
     def create(db: Session, **kwargs) -> Device:
         device = Device(**kwargs)
         db.add(device)

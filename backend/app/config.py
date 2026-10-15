@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     SQL_POOL_SIZE: int = 10
     SQL_MAX_OVERFLOW: int = 20
     SQL_POOL_RECYCLE: int = 1800  # seconds
+    # Login timeout (seconds) passed to pyodbc.connect(timeout=...). Keeps /health
+    # responsive when SQL Server is unreachable instead of blocking on the driver default.
+    SQL_CONNECT_TIMEOUT: int = 15
 
     @property
     def database_url(self) -> str:
@@ -101,6 +104,14 @@ class Settings(BaseSettings):
     MQTT_RECONNECT_DELAY: int = 5   # seconds between reconnect attempts
     MQTT_MAX_RECONNECT_DELAY: int = 120
 
+    # ── Process composition ───────────────────────────────────────────────────
+    # Defaults keep the historical single-process behaviour (API + MQTT consumer
+    # + TCP listener in one uvicorn process, as deployed by Ansible). The Docker
+    # Compose deployment runs the TCP listener in its own container
+    # (python -m app.tcp.server) and sets ENABLE_TCP_SERVER=false for storm-api.
+    ENABLE_MQTT_CONSUMER: bool = True
+    ENABLE_TCP_SERVER: bool = True
+
     # ── TCP listener ──────────────────────────────────────────────────────────
     TCP_HOST: str = "0.0.0.0"
     TCP_PORT: int = 8100
@@ -111,6 +122,21 @@ class Settings(BaseSettings):
     # ── Telemetry pipeline ────────────────────────────────────────────────────
     DEDUP_WINDOW_SECONDS: int = 30  # identical device+timestamp within this window = duplicate
     HISTORICAL_THRESHOLD_SECONDS: int = 300  # if RTU ts is older than 5 min, treat as historical
+
+    # ── Protocol diagnostics (Protocol Test Log) ─────────────────────────────
+    # Every TCP packet / MQTT message seen by the ingestion pipeline is also written to
+    # dbo.ProtocolDiagnosticLogs. Diagnostics never affect ingestion: failures are logged
+    # and swallowed, and writes are rate-limited so a flood cannot grow the table unbounded.
+    DIAG_ENABLED: bool = True
+    DIAG_RETENTION_DAYS: int = Field(default=30, ge=1, le=365)
+    DIAG_PURGE_ENABLED: bool = True               # storm-api only; purges rows older than retention
+    DIAG_PURGE_INTERVAL_SECONDS: int = Field(default=3600, ge=60)
+    DIAG_PURGE_BATCH_SIZE: int = Field(default=5000, ge=100, le=50000)
+    DIAG_MAX_WRITES_PER_MINUTE: int = Field(default=600, ge=1)   # per process
+    DIAG_PAYLOAD_MAX_CHARS: int = Field(default=4000, ge=64, le=4000)
+    # Testing page: storm-api checks the TCP listener (storm-tcp container) with a plain
+    # connect, at most once a minute. Empty = do not probe (status "unknown").
+    DIAG_TCP_PROBE_HOST: str = "storm-tcp"
 
     # ── Modbus / RS485 (server-side representation) ──────────────────────────
     # Actual register mapping is provided by Storm and stored in DeviceConfiguration.

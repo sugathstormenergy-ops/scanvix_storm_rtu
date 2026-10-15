@@ -1,5 +1,13 @@
 # Storm Energy RTU Platform — Deployment Guide
 
+> **Preferred method: Docker Compose on Windows server 192.168.0.50.**
+> See the repository `README.md` (sections 1–13): `.\deploy.ps1`, `.\status.ps1`,
+> `.\health-check.ps1`, `.\update.ps1`, `.\stop.ps1`, `.\backup.ps1`.
+> 192.168.0.109 is an existing server and is not part of the Docker deployment.
+>
+> The remainder of this document describes the **legacy Ansible deployment to a
+> Linux host** and is kept for reference only (see `ansible/README.md`).
+
 ## Prerequisites
 
 | Requirement | Version |

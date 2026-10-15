@@ -1,0 +1,163 @@
+[1mdiff --git "a/.\\backend\\app\\protocol\\tcp_parser.py" "b/C:\\Users\\Storm\\AppData\\Local\\Temp\\storm-parser-review-20261013-110048\\backend\\app\\protocol\\tcp_parser.py"[m
+[1mindex 400f308..44b8adb 100644[m
+[1m--- "a/.\\backend\\app\\protocol\\tcp_parser.py"[m
+[1m+++ "b/C:\\Users\\Storm\\AppData\\Local\\Temp\\storm-parser-review-20261013-110048\\backend\\app\\protocol\\tcp_parser.py"[m
+[36m@@ -1,10 +1,8 @@[m
+ """[m
+ Storm Energy RTU Platform — TCP ASCII Packet Parser.[m
+ [m
+[31m-NOTE: The exact TCP packet format for Scanvix RTUs is defined as ASCII[m
+[31m-but the field layout has NOT yet been finalised with Scanvix.[m
+[31m-[m
+[31m-Current status: TBD — to be agreed with Scanvix.[m
+[32m+[m[32mNOTE: The Scanvix production frame ("#SP,...") is implemented by ScanvixSpFrameParser, confirmed by[m
+[32m+[m[32mScanvix from a real captured packet. The placeholder pipe format below remains for internal testing only.[m
+ [m
+ This module provides:[m
+   1. A pluggable parser interface so the real format can be dropped in[m
+[36m@@ -18,6 +16,7 @@[m [mfrom __future__ import annotations[m
+ [m
+ import json[m
+ import logging[m
+[32m+[m[32mimport re[m
+ from abc import ABC, abstractmethod[m
+ from datetime import datetime[m
+ from typing import Optional[m
+[36m@@ -119,6 +118,129 @@[m [mclass JsonOverTcpParser(TcpParser):[m
+         return telemetry[m
+ [m
+ [m
+[32m+[m[32mclass ScanvixSpFrameParser(TcpParser):[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Scanvix production TCP frame, confirmed by Scanvix from a real packet captured on the Storm TCP[m
+[32m+[m[32m    endpoint. The captured wire format is authoritative (it differs from the written protocol document).[m
+[32m+[m
+[32m+[m[32m    Wire layout (bytes, comma separated; NOT ordinary CSV - the telemetry block is binary):[m
+[32m+[m
+[32m+[m[32m        #SP , <device id> , NUL<IMEI> , HH:MM:SS , DD/MM/YYYY , <sensor byte> , <signal> , <firmware>NUL ,[m
+[32m+[m[32m        <f1> , <f2> , ... , <fN> ,          N binary fields of exactly 4 bytes, each followed by a comma[m
+[32m+[m[32m        00000 , 00000 , 00000 , 00000 , 00000 , 00000 , 00000 ,      7 ASCII fields of 5 digits, each + comma[m
+[32m+[m[32m        .                                                           terminator[m
+[32m+[m
+[32m+[m[32m    Binary fields are fixed width (4 bytes), so they are located by position and never split on commas[m
+[32m+[m[32m    (a binary value may legitimately contain 0x2C). The frame is parsed from raw bytes; nothing is[m
+[32m+[m[32m    normalised before the caller archives the original bytes.[m
+[32m+[m
+[32m+[m[32m    Binary field order (Scanvix): Instant Flow, Positive Totaliser, AI3, AI4, AI5, Today Total,[m
+[32m+[m[32m    Previous Day Total, 4-20mA 1, 4-20mA 2. Layouts with 9 fields (151 bytes in total, as specified) and[m
+[32m+[m[32m    8 fields (146 bytes: the size of the packet actually captured, the 9th field absent) are accepted;[m
+[32m+[m[32m    anything else is rejected.[m
+[32m+[m
+[32m+[m[32m    Only the confirmed structure is recognised. Anything starting "#SP," that deviates from it is[m
+[32m+[m[32m    rejected with a specific MALFORMED_PACKET reason (never passed on to another parser, never VALID).[m
+[32m+[m[32m    """[m
+[32m+[m
+[32m+[m[32m    PREFIX = b"#SP"[m
+[32m+[m[32m    BINARY_FIELDS = ("instant_flow", "positive_totaliser", "ai3", "ai4", "ai5",[m
+[32m+[m[32m                     "today_total", "previous_day_total", "ma_4_20_1", "ma_4_20_2")[m
+[32m+[m[32m    ACCEPTED_FIELD_COUNTS = (9, 8)[m
+[32m+[m[32m    SENSOR_TYPES = {1: "rs485"}                     # 1 = RS485 (the only value Scanvix has defined)[m
+[32m+[m[32m    _TAIL = re.compile(rb"(?:[0-9]{5},){7}\.")      # 7 x 5 ASCII digits, terminator[m
+[32m+[m[32m    _TAIL_LEN = 7 * 6 + 1[m
+[32m+[m[32m    _DEVICE = re.compile(rb"[A-Za-z0-9_-]{1,32}")[m
+[32m+[m[32m    _IMEI = re.compile(rb"[0-9]{15}")[m
+[32m+[m[32m    _TIME = re.compile(rb"([0-9]{2}):([0-9]{2}):([0-9]{2})")[m
+[32m+[m[32m    _DATE = re.compile(rb"([0-9]{2})/([0-9]{2})/([0-9]{4})")[m
+[32m+[m[32m    _FW = re.compile(rb"[A-Za-z0-9._-]{1,16}")[m
+[32m+[m
+[32m+[m[32m    def can_parse(self, raw: bytes) -> bool:[m
+[32m+[m[32m        return raw.startswith(self.PREFIX + b",")[m
+[32m+[m
+[32m+[m[32m    @staticmethod[m
+[32m+[m[32m    def decode_binary_field(name: str, field: bytes) -> float:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        THE single place where the 4-byte telemetry fields are decoded.[m
+[32m+[m
+[32m+[m[32m        The byte order and the REAL4 / LONG type of each field are NOT yet confirmed (neither the repository[m
+[32m+[m[32m        nor the one captured packet, whose fields are all 00 00 00 00, establishes them), so only the[m
+[32m+[m[32m        confirmed value - all four bytes zero, which is 0 in every encoding - is decoded. Any other value is[m
+[32m+[m[32m        rejected with the raw bytes in the message instead of guessing a number into production telemetry.[m
+[32m+[m[32m        Add the real decoding here once Scanvix confirms the encoding.[m
+[32m+[m[32m        """[m
+[32m+[m[32m        if field == b"\x00\x00\x00\x00":[m
+[32m+[m[32m            return 0.0[m
+[32m+[m[32m        raise PayloadValidationError([m
+[32m+[m[32m            ValidationErrorCode.MALFORMED_PACKET,[m
+[32m+[m[32m            f"Scanvix frame: binary field '{name}' is {field.hex(' ')}; non-zero binary encoding "[m
+[32m+[m[32m            f"(byte order / REAL4 vs LONG) is not confirmed yet, value not decoded",[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m    @staticmethod[m
+[32m+[m[32m    def _bad(reason: str, raw: bytes) -> PayloadValidationError:[m
+[32m+[m[32m        return PayloadValidationError(ValidationErrorCode.MALFORMED_PACKET, f"Scanvix #SP frame rejected: {reason}", raw)[m
+[32m+[m
+[32m+[m[32m    def parse(self, raw: bytes, source_ip: str) -> NormalizedTelemetry:[m
+[32m+[m[32m        frame = raw.rstrip(b"\r\n ")[m
+[32m+[m[32m        parts = frame.split(b",", 8)[m
+[32m+[m[32m        if len(parts) != 9 or parts[0] != self.PREFIX:[m
+[32m+[m[32m            raise self._bad("header incomplete (expected prefix, device, IMEI, time, date, sensor, signal, firmware)", raw)[m
+[32m+[m[32m        _, dev, imei_raw, tm, dt, sensor, signal, fw_raw, rest = parts[m
+[32m+[m
+[32m+[m[32m        if not self._DEVICE.fullmatch(dev.strip(b"\x00")):[m
+[32m+[m[32m            raise self._bad("device id field is not a plain identifier", raw)[m
+[32m+[m[32m        imei_b = imei_raw.strip(b"\x00")           # the wire carries a leading NUL before the IMEI[m
+[32m+[m[32m        if not self._IMEI.fullmatch(imei_b):[m
+[32m+[m[32m            raise self._bad("IMEI is not exactly 15 digits", raw)[m
+[32m+[m[32m        mt, md = self._TIME.fullmatch(tm), self._DATE.fullmatch(dt)[m
+[32m+[m[32m        if not mt or not md:[m
+[32m+[m[32m            raise self._bad("time must be HH:MM:SS and date DD/MM/YYYY", raw)[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            timestamp = datetime(int(md[3]), int(md[2]), int(md[1]), int(mt[1]), int(mt[2]), int(mt[3]))[m
+[32m+[m[32m        except ValueError:[m
+[32m+[m[32m            raise self._bad("time/date is not a valid calendar value", raw)[m
+[32m+[m[32m        # sensor type: the binary byte 0x01 (an ASCII '1' is tolerated as the same value)[m
+[32m+[m[32m        code = sensor[0] if len(sensor) == 1 and sensor[0] < 32 else (int(sensor) if sensor.isdigit() and len(sensor) == 1 else None)[m
+[32m+[m[32m        if code not in self.SENSOR_TYPES:[m
+[32m+[m[32m            raise self._bad(f"unknown sensor type byte {sensor.hex()}", raw)[m
+[32m+[m[32m        if not (1 <= len(signal) <= 3 and signal.isdigit()):[m
+[32m+[m[32m            raise self._bad("signal field is not a number", raw)[m
+[32m+[m[32m        fw_b = fw_raw.strip(b"\x00")[m
+[32m+[m[32m        if not self._FW.fullmatch(fw_b):[m
+[32m+[m[32m            raise self._bad("firmware field is not a plain version string", raw)[m
+[32m+[m
+[32m+[m[32m        if len(rest) < self._TAIL_LEN or not self._TAIL.fullmatch(rest[-self._TAIL_LEN:]):[m
+[32m+[m[32m            raise self._bad("trailing block must be 7 five-digit ASCII fields followed by '.'", raw)[m
+[32m+[m[32m        body = rest[: -self._TAIL_LEN][m
+[32m+[m[32m        n, rem = divmod(len(body), 5)[m
+[32m+[m[32m        if rem or n not in self.ACCEPTED_FIELD_COUNTS or any(body[i * 5 + 4: i * 5 + 5] != b"," for i in range(n)):[m
+[32m+[m[32m            raise self._bad(f"binary block must be {' or '.join(map(str, self.ACCEPTED_FIELD_COUNTS))} "[m
+[32m+[m[32m                            f"comma-terminated 4-byte fields (got {len(body)} bytes)", raw)[m
+[32m+[m[32m        values = {name: self.decode_binary_field(name, body[i * 5: i * 5 + 4])[m
+[32m+[m[32m                  for i, name in enumerate(self.BINARY_FIELDS[:n])}[m
+[32m+[m[32m        trailing = [b.decode("ascii") for b in rest[-self._TAIL_LEN:-1].split(b",") if b][m
+[32m+[m
+[32m+[m[32m        # Mapped to existing model fields only. Positive totaliser, AI3-5 and the two 4-20mA inputs have no[m
+[32m+[m[32m        # model field (two inputs vs a single PRESSURE column) and are validated but not persisted; the[m
+[32m+[m[32m        # frame carries no flow unit, so none is invented. READ01-READ05 take the first five trailing fields[m
+[32m+[m[32m        # (7 are sent; the mapping of the last two is unknown, so they are not persisted).[m
+[32m+[m[32m        return NormalizedTelemetry([m
+[32m+[m[32m            device_id       = imei_b.decode("ascii"),[m
+[32m+[m[32m            protocol        = "TCP",[m
+[32m+[m[32m            timestamp       = timestamp,[m
+[32m+[m[32m            flow            = values["instant_flow"],[m
+[32m+[m[32m            total_today     = values["today_total"],[m
+[32m+[m[32m            total_yesterday = values["previous_day_total"],[m
+[32m+[m[32m            sensor_type     = self.SENSOR_TYPES[code],[m
+[32m+[m[32m            signal_dbm      = int(signal),[m
+[32m+[m[32m            fw_version      = fw_b.decode("ascii"),[m
+[32m+[m[32m            read01=trailing[0], read02=trailing[1], read03=trailing[2], read04=trailing[3], read05=trailing[4],[m
+[32m+[m[32m            source_ip       = source_ip,[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m
+ class PlaceholderAsciiParser(TcpParser):[m
+     """[m
+     Placeholder for the final Scanvix ASCII TCP frame format.[m
+[36m@@ -196,6 +318,7 @@[m [mclass PlaceholderAsciiParser(TcpParser):[m
+ # Ordered list of parsers — first match wins[m
+ _PARSERS: list[TcpParser] = [[m
+     JsonOverTcpParser(),[m
+[32m+[m[32m    ScanvixSpFrameParser(),[m
+     PlaceholderAsciiParser(),[m
+ ][m
+ [m

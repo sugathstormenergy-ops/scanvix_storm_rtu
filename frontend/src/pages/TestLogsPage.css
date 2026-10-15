@@ -1,0 +1,75 @@
+/* Protocol Test Log - dark terminal/monitoring panel inside the Storm shell
+   (visual reference: the existing "STORM ENERGY RTU - TCP TEST LOG" viewer). */
+.tlog {
+  margin: 16px; border-radius: var(--radius-md); overflow: hidden;
+  background: #0f1115; color: #d7dbe0; box-shadow: var(--shadow-card);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px;
+}
+.tlog-head { padding: 16px 20px 12px; border-bottom: 1px solid #2a2f3a; }
+.tlog-head h1 { font-size: 16px; letter-spacing: 1px; margin: 0; font-weight: 700; }
+.tlog-sub { font-size: 12px; color: #8b93a1; margin-top: 3px; }
+.tlog-tabs { display: flex; gap: 8px; margin-top: 12px; }
+.tlog-tab {
+  font: inherit; font-weight: 700; letter-spacing: 1px; cursor: pointer;
+  background: transparent; color: #8b93a1; border: 1px solid #2a2f3a; border-radius: 4px; padding: 5px 14px;
+}
+.tlog-tab.active { color: #0f1115; background: #5fe0a0; border-color: #5fe0a0; }
+.tlog-status {
+  display: flex; flex-wrap: wrap; gap: 10px 26px; align-items: center;
+  padding: 12px 20px; border-bottom: 1px solid #2a2f3a; font-size: 12px; color: #8b93a1;
+}
+.tlog-status b { color: #e6ebf1; font-weight: 600; margin-left: 6px; }
+.tlog-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; }
+.tlog-dot.ok { background: #5fe0a0; } .tlog-dot.bad { background: #f08a7a; }
+.tlog-btn {
+  font: inherit; font-size: 11.5px; font-weight: 700; letter-spacing: .5px; cursor: pointer;
+  background: #161a22; color: #d7dbe0; border: 1px solid #2f3542; border-radius: 4px; padding: 5px 12px;
+}
+.tlog-btn:hover:not(:disabled) { border-color: #5fe0a0; color: #5fe0a0; }
+.tlog-btn:disabled { opacity: .4; cursor: default; }
+.tlog-filters { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end; padding: 12px 20px; border-bottom: 1px solid #2a2f3a; }
+.tlog-filters label, .tlog-foot label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: #8b93a1; }
+.tlog-foot label { flex-direction: row; align-items: center; gap: 6px; }
+.tlog-filters input, .tlog-filters select, .tlog-foot select {
+  font: inherit; font-size: 12px; background: #0a0c10; color: #e6ebf1; border: 1px solid #2f3542; border-radius: 4px; padding: 5px 8px; min-width: 150px;
+}
+.tlog-foot select { min-width: 0; }
+.tlog-table-wrap { overflow-x: auto; max-height: calc(100vh - 420px); min-height: 240px; overflow-y: auto; }
+.tlog-table { width: 100%; border-collapse: collapse; }
+.tlog-table th, .tlog-table td { text-align: left; padding: 7px 12px; border-bottom: 1px solid #20242e; vertical-align: top; }
+.tlog-table th { color: #8b93a1; position: sticky; top: 0; background: #0f1115; font-weight: 600; z-index: 1; white-space: nowrap; }
+.tlog-table tr.row:hover td { background: #161a22; }
+.tlog-table tr.row.bad td:first-child { box-shadow: inset 3px 0 0 #f08a7a; }
+.tlog-table tr.row.warn td:first-child { box-shadow: inset 3px 0 0 #e0b23c; }
+.tlog-nowrap { white-space: nowrap; }
+.tlog-topic { max-width: 260px; overflow-wrap: anywhere; }
+.tlog-payload { max-width: 420px; }
+.tlog-link {
+  font: inherit; color: #9fb0c3; background: none; border: 0; padding: 0; cursor: pointer; text-align: left;
+  display: block; max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tlog-link:hover { color: #e6ebf1; text-decoration: underline; }
+.tlog-tag { font-size: 10px; background: #33321a; color: #e0cf7a; border-radius: 3px; padding: 0 4px; margin-right: 6px; }
+.tlog-badge { font-size: 11px; padding: 2px 7px; border-radius: 3px; font-weight: 700; white-space: nowrap; }
+.tlog-badge.ok { background: #123a25; color: #5fe0a0; }
+.tlog-badge.bad { background: #3a1717; color: #f08a7a; }
+.tlog-badge.warn { background: #3a2a0d; color: #f0b44c; }
+.tlog-reason { font-size: 10.5px; color: #c98a80; margin-top: 3px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tlog-muted { color: #6b7280; }
+.tlog-error { color: #f08a7a; }
+.tlog-banner { padding: 10px 20px; border-bottom: 1px solid #2a2f3a; background: #1c1214; }
+.tlog-foot { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; padding: 10px 20px; font-size: 12px; color: #8b93a1; }
+.tlog-modal-backdrop { position: fixed; inset: 0; z-index: 70; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; padding: 20px; }
+.tlog-modal {
+  width: min(900px, 96vw); max-height: 88vh; overflow: auto; background: #12151c; color: #d7dbe0; border: 1px solid #2a2f3a;
+  border-radius: 8px; padding: 14px 18px 18px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px;
+}
+.tlog-modal-head { display: flex; justify-content: space-between; align-items: center; font-weight: 700; letter-spacing: 1px; margin-bottom: 10px; }
+.tlog-kv { display: grid; grid-template-columns: 150px 1fr; gap: 4px 12px; }
+.tlog-kv > div:nth-child(odd) { color: #8b93a1; }
+.tlog-sec { color: #8b93a1; font-size: 11px; letter-spacing: 1px; margin: 14px 0 4px; }
+.tlog-pre {
+  margin: 0; padding: 10px 12px; background: #0a0c10; border: 1px solid #232833; border-radius: 4px;
+  white-space: pre-wrap; word-break: break-all; color: #e6ebf1; font-size: 12.5px; font-family: inherit;
+}
+@media (max-width: 700px) { .tlog { margin: 8px; } .tlog-kv { grid-template-columns: 1fr; } }

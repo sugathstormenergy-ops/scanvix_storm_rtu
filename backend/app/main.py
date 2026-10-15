@@ -27,6 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.commands import router as commands_router, set_command_service
 from app.api.configuration import router as configuration_router
 from app.api.devices import router as devices_router
+from app.api.diagnostics import router as diagnostics_router
+from app.api.analytics import router as analytics_router
 from app.api.events import router as events_router
 from app.api.health import router as health_router, set_service_refs
 from app.api.telemetry import router as telemetry_router
@@ -109,6 +111,8 @@ app.include_router(telemetry_router)
 app.include_router(commands_router)
 app.include_router(configuration_router)
 app.include_router(events_router)
+app.include_router(diagnostics_router)
+app.include_router(analytics_router)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Service singletons
@@ -142,23 +146,30 @@ async def on_startup():
     except Exception as exc:
         logger.error("Failed to load device registry: %s", exc)
 
-    # 3. MQTT consumer
-    try:
-        _mqtt_consumer = MQTTConsumer()
-        _mqtt_consumer.start()
-    except Exception as exc:
-        logger.error("MQTT consumer failed to start: %s", exc)
-        _mqtt_consumer = None
+    # 3. MQTT consumer (ENABLE_MQTT_CONSUMER, default on)
+    if settings.ENABLE_MQTT_CONSUMER:
+        try:
+            _mqtt_consumer = MQTTConsumer()
+            _mqtt_consumer.start()
+        except Exception as exc:
+            logger.error("MQTT consumer failed to start: %s", exc)
+            _mqtt_consumer = None
+    else:
+        logger.info("MQTT consumer disabled in this process (ENABLE_MQTT_CONSUMER=false)")
 
-    # 4. TCP server
-    try:
-        _tcp_server = TCPServer()
-        await _tcp_server.start()
-        # Run TCP server in background
-        asyncio.create_task(_tcp_server.serve_forever())
-    except Exception as exc:
-        logger.error("TCP server failed to start: %s", exc)
-        _tcp_server = None
+    # 4. TCP server (ENABLE_TCP_SERVER, default on). In the Docker deployment the
+    #    TCP listener runs in its own container: python -m app.tcp.server
+    if settings.ENABLE_TCP_SERVER:
+        try:
+            _tcp_server = TCPServer()
+            await _tcp_server.start()
+            # Run TCP server in background
+            asyncio.create_task(_tcp_server.serve_forever())
+        except Exception as exc:
+            logger.error("TCP server failed to start: %s", exc)
+            _tcp_server = None
+    else:
+        logger.info("TCP listener disabled in this process (ENABLE_TCP_SERVER=false)")
 
     # 5. Command service
     mqtt_client = _mqtt_consumer._client if _mqtt_consumer else None
@@ -168,11 +179,19 @@ async def on_startup():
     # 6. Wire health check service references
     set_service_refs(_mqtt_consumer, _tcp_server)
 
+    # 7. Protocol Test Log retention (30 days): background purge of
+    #    dbo.ProtocolDiagnosticLogs ONLY. Runs here (storm-api), never in storm-tcp.
+    if settings.DIAG_PURGE_ENABLED:
+        from app.diagnostics.retention import retention_loop
+        asyncio.create_task(retention_loop())
+        logger.info("Protocol diagnostics retention: %d days, checked every %ds",
+                    settings.DIAG_RETENTION_DAYS, settings.DIAG_PURGE_INTERVAL_SECONDS)
+
     logger.info(
-        "Platform started — API=%s:%d MQTT=%s TCP=%s:%d",
+        "Platform started — API=%s:%d MQTT=%s TCP=%s",
         settings.API_HOST, settings.API_PORT,
-        f"{settings.MQTT_HOST}:{settings.MQTT_PORT}",
-        settings.TCP_HOST, settings.TCP_PORT,
+        f"{settings.MQTT_HOST}:{settings.MQTT_PORT}" if settings.ENABLE_MQTT_CONSUMER else "disabled",
+        f"{settings.TCP_HOST}:{settings.TCP_PORT}" if settings.ENABLE_TCP_SERVER else "disabled",
     )
 
 

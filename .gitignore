@@ -11,7 +11,8 @@ venv/
 *.egg-info/
 dist/
 build/
-
+.*
+*.ps1
 # ─── Secrets — NEVER commit these ────────────────────────────────────────────
 *.key
 *.pem
@@ -71,3 +72,15 @@ ansible/scanvix_rtu/inventory/hosts.ini
 
 scanvix_rtu_ansible.tar.gz
 scanvix_rtu_tcp_log_viewer_additions.tar.gz
+
+# ─── Docker deployment (192.168.0.50) — never commit ─────────────────────────
+.local/
+certs/*
+!certs/README.md
+secrets/
+backups/
+*.crt
+*.csr
+*.srl
+compose.override.yml
+docker-compose.override.yml

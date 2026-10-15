@@ -12,6 +12,7 @@ from app.timezone import now_ist
 from typing import Optional
 
 from app.config import get_settings
+from app.diagnostics.recorder import DiagnosticEvent, record as record_diagnostic
 from app.database.database import db_session
 from app.database.repository import MQTTMessageRepository, RawMessageRepository
 from app.mqtt.client import MQTTClient
@@ -84,21 +85,47 @@ class MQTTConsumer:
 
         logger.debug("MQTT RX: topic=%s qos=%d len=%d", topic, qos, len(payload))
         self._msg_count += 1
+        # Protocol Test Log entry: server receipt time; the MQTT subscriber cannot see the
+        # publisher's client ID or IP, so the device is identified from the topic/payload.
+        diag = DiagnosticEvent(protocol="MQTT", received_at=now_ist(), raw=bytes(payload),
+                               parsed_ok=False, topic=topic, qos=qos)
 
-        parsed_topic = parse_topic(topic)
-        if parsed_topic is None:
-            logger.warning("MQTT message on unexpected topic '%s' — ignored", topic)
-            return
+        try:
+            parsed_topic = parse_topic(topic)
+            if parsed_topic is None:
+                logger.warning("MQTT message on unexpected topic '%s' — ignored", topic)
+                diag.outcome = "UNEXPECTED_TOPIC"
+                diag.error_reason = "INVALID_TOPIC: topic does not match storm/meters/<deviceId>/<type>"
+                return
 
-        if parsed_topic.message_type == "telemetry":
-            self._process_telemetry(topic, payload, qos)
-        elif parsed_topic.message_type == "status":
-            self._process_status(topic, payload)
-        else:
-            logger.debug("MQTT topic type '%s' received — no handler yet", parsed_topic.message_type)
+            if parsed_topic.message_type == "telemetry":
+                self._process_telemetry(topic, payload, qos, diag)
+            elif parsed_topic.message_type == "status":
+                self._process_status(topic, payload)
+                self._classify_non_telemetry(diag, parsed_topic.device_id, payload, "STATUS")
+            else:
+                logger.debug("MQTT topic type '%s' received — no handler yet", parsed_topic.message_type)
+                self._classify_non_telemetry(diag, parsed_topic.device_id, payload, "NOT_HANDLED")
+        finally:
+            record_diagnostic(diag)   # own session; never raises
 
-    def _process_telemetry(self, topic: str, payload: bytes, qos: int) -> None:
+    @staticmethod
+    def _classify_non_telemetry(diag: DiagnosticEvent, device_id: str, payload: bytes, outcome: str) -> None:
+        """status/attributes topics: accepted when the payload is JSON (device from the topic)."""
+        import json
+        diag.device_id = device_id
+        diag.outcome = outcome
+        try:
+            json.loads(payload)
+            diag.parsed_ok = True
+        except Exception as exc:
+            diag.error_reason = f"INVALID_JSON: {exc}"
+
+    def _process_telemetry(self, topic: str, payload: bytes, qos: int,
+                           diag: Optional[DiagnosticEvent] = None) -> None:
         raw_id: Optional[int] = None
+        diag = diag or DiagnosticEvent(protocol="MQTT", received_at=now_ist(), raw=bytes(payload),
+                                       parsed_ok=False, topic=topic, qos=qos)
 
         try:
             with db_session() as db:
@@ -106,7 +133,7 @@ class MQTTConsumer:
                 raw = RawMessageRepository.create(
                     db,
                     Protocol   = "MQTT",
-                    ReceivedAt = now_ist(),
+                    ReceivedAt = diag.received_at,
                     Topic      = topic,
                     Payload    = payload.decode("utf-8", errors="replace"),
                     IsValid    = True,
@@ -117,12 +144,17 @@ class MQTTConsumer:
                 try:
                     telemetry = parse_mqtt_payload(topic, payload)
                     telemetry.raw_message_id = raw_id
+                    diag.parsed_ok = True
+                    diag.device_id = telemetry.device_id
+                    diag.site_id = telemetry.site_id
                 except PayloadValidationError as ve:
                     raw.IsValid    = True   # message received — invalid content
                     raw.ErrorMessage = str(ve)
                     db.flush()
                     logger.warning("MQTT parse error [%s]: %s | topic=%s", ve.error.code, ve, topic)
                     self._err_count += 1
+                    diag.outcome = "PARSE_ERROR"
+                    diag.error_reason = f"{ve.error.code.value}: {ve}"
                     # Archive MQTT message record with INVALID status
                     MQTTMessageRepository.create(
                         db,
@@ -152,6 +184,7 @@ class MQTTConsumer:
                 # 5. Update MQTT message status
                 status = "PROCESSED" if result["status"] == "stored" else result["status"].upper()
                 MQTTMessageRepository.update_status(db, mqtt_msg.Id, status)
+                diag.outcome = status
 
                 logger.info(
                     "MQTT telemetry ingested: device=%s ts=%s status=%s historical=%s",
@@ -161,6 +194,8 @@ class MQTTConsumer:
 
         except Exception as exc:
             self._err_count += 1
+            diag.outcome = "SERVER_ERROR"
+            diag.error_reason = f"{type(exc).__name__}: {exc}"
             logger.exception("Unhandled error processing MQTT telemetry on topic %s: %s", topic, exc)
 
     def _process_status(self, topic: str, payload: bytes) -> None:

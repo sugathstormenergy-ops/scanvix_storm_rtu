@@ -1,6 +1,7 @@
 """
 Storm Energy RTU Platform — Device management API.
 GET  /api/devices
+GET  /api/devices/latest        (read-only: every device + its latest telemetry)
 GET  /api/devices/{device_id}
 POST /api/devices
 PUT  /api/devices/{device_id}
@@ -14,8 +15,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.api.telemetry import TelemetryOut, _to_out as _telemetry_to_out
 from app.database.database import get_db
+from app.database.repository import DeviceRepository
 from app.services.device_service import DeviceService
+from app.timezone import now_ist
 
 router = APIRouter(prefix="/api/devices", tags=["Devices"])
 
@@ -47,8 +51,22 @@ class DeviceOut(BaseModel):
     last_seen_at:       Optional[datetime]
     last_ip_address:    Optional[str]
     created_at:         datetime
+    name:               Optional[str]   = None   # NULL until the meter register is imported
+    latitude:           Optional[float] = None   # NULL = "No location assigned"
+    longitude:          Optional[float] = None
 
     model_config = {"from_attributes": True}
+
+
+class DeviceLatestOut(DeviceOut):
+    latest_telemetry: Optional[TelemetryOut] = None   # null when the device has no telemetry
+
+
+class DevicesLatestResponse(BaseModel):
+    # server_time uses the SAME naive-IST convention as last_seen_at / telemetry timestamps,
+    # so clients compute ages as (server_time - last_seen_at) without timezone or clock-skew errors.
+    server_time: datetime
+    devices:     List[DeviceLatestOut]
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -57,6 +75,19 @@ class DeviceOut(BaseModel):
 def list_devices(db: Session = Depends(get_db)):
     devices = DeviceService.get_all(db)
     return [_to_out(d) for d in devices]
+
+
+@router.get("/latest", response_model=DevicesLatestResponse,
+            summary="Every device (active and inactive) with its latest telemetry (read-only)")
+def list_devices_with_latest(db: Session = Depends(get_db)):
+    # Declared BEFORE /{device_id} so "latest" is never interpreted as a device id.
+    rows = DeviceRepository.list_with_latest_telemetry(db)      # one SQL statement
+    devices = []
+    for d, t in rows:
+        out = DeviceLatestOut(**_to_out(d).model_dump(),
+                              latest_telemetry=_telemetry_to_out(t) if t is not None else None)
+        devices.append(out)
+    return DevicesLatestResponse(server_time=now_ist(), devices=devices)
 
 
 @router.get("/{device_id}", response_model=DeviceOut, summary="Get device by ID")
@@ -116,4 +147,7 @@ def _to_out(d) -> DeviceOut:
         last_seen_at       = d.LastSeenAt,
         last_ip_address    = d.LastIPAddress,
         created_at         = d.CreatedAt,
+        name               = d.Name,
+        latitude           = d.Latitude,
+        longitude          = d.Longitude,
     )

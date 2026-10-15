@@ -11,7 +11,7 @@ from app.timezone import now_ist
 
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Enum, Float, ForeignKey,
-    Integer, String, Text, UniqueConstraint, Index,
+    Integer, Numeric, String, Text, UniqueConstraint, Index,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -89,6 +89,11 @@ class Device(Base):
     LastIPAddress:      Mapped[str | None]    = mapped_column(String(45), nullable=True)
     CreatedAt:          Mapped[datetime]      = mapped_column(DateTime, nullable=False, default=lambda: now_ist())
     UpdatedAt:          Mapped[datetime]      = mapped_column(DateTime, nullable=False, default=lambda: now_ist(), onupdate=lambda: now_ist())
+    # Optional display / GIS metadata (database/005_device_metadata.sql). NULL = not assigned.
+    # Populated later from the meter register (Excel import is a separate task).
+    Name:               Mapped[str | None]    = mapped_column(String(100), nullable=True)
+    Latitude:           Mapped[float | None]  = mapped_column(Numeric(9, 6, asdecimal=False), nullable=True)
+    Longitude:          Mapped[float | None]  = mapped_column(Numeric(9, 6, asdecimal=False), nullable=True)
 
     configuration: Mapped[DeviceConfiguration | None] = relationship("DeviceConfiguration", back_populates="device", uselist=False)
     telemetry:     Mapped[list[Telemetry]]             = relationship("Telemetry",           back_populates="device")
@@ -239,3 +244,38 @@ class DeviceEvent(Base):
     CreatedAt:   Mapped[datetime] = mapped_column(DateTime,   nullable=False, default=lambda: now_ist())
 
     device: Mapped[Device] = relationship("Device", back_populates="events")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Protocol diagnostics (Protocol Test Log) - database/006_protocol_diagnostics.sql
+# Self-contained: NO foreign key to Devices, so unknown senders can be logged
+# without creating registrations. The ONLY table the 30-day retention purge may
+# delete from (app.diagnostics.retention).
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ProtocolDiagnosticLog(Base):
+    __tablename__ = "ProtocolDiagnosticLogs"
+    __table_args__ = (
+        Index("IX_ProtocolDiagnosticLogs_Protocol_ReceivedAt", "Protocol", "ReceivedAt", "Id"),
+        Index("IX_ProtocolDiagnosticLogs_ReceivedAt", "ReceivedAt"),
+    )
+
+    Id:               Mapped[int]         = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ReceivedAt:       Mapped[datetime]    = mapped_column(DateTime,     nullable=False)   # server IST, set at receipt
+    Protocol:         Mapped[str]         = mapped_column(String(10),   nullable=False)   # TCP | MQTT
+    Status:           Mapped[str]         = mapped_column(String(20),   nullable=False)   # VALID | INVALID | UNKNOWN_DEVICE
+    Outcome:          Mapped[str | None]  = mapped_column(String(30),   nullable=True)    # pipeline result, e.g. PROCESSED
+    SourceIP:         Mapped[str | None]  = mapped_column(String(45),   nullable=True)
+    DeviceId:         Mapped[str | None]  = mapped_column(String(50),   nullable=True)    # as identified by the parser
+    DeviceName:       Mapped[str | None]  = mapped_column(String(100),  nullable=True)    # registry snapshot
+    IMEI:             Mapped[str | None]  = mapped_column(String(20),   nullable=True)    # registry value (registered only)
+    SiteId:           Mapped[str | None]  = mapped_column(String(50),   nullable=True)
+    IsRegistered:     Mapped[bool]        = mapped_column(Boolean,      nullable=False, default=False)
+    Topic:            Mapped[str | None]  = mapped_column(String(255),  nullable=True)
+    QoS:              Mapped[int | None]  = mapped_column(Integer,      nullable=True)
+    Payload:          Mapped[str]         = mapped_column(String(4000), nullable=False)   # text, or hex for binary
+    PayloadEncoding:  Mapped[str]         = mapped_column(String(10),   nullable=False)   # TEXT | HEX
+    PayloadBytes:     Mapped[int]         = mapped_column(Integer,      nullable=False)   # original size
+    PayloadTruncated: Mapped[bool]        = mapped_column(Boolean,      nullable=False, default=False)
+    ErrorReason:      Mapped[str | None]  = mapped_column(String(500),  nullable=True)
+    CreatedAt:        Mapped[datetime]    = mapped_column(DateTime,     nullable=False, default=lambda: now_ist())

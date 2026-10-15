@@ -21,7 +21,16 @@ BEGIN
         LastSeenAt          DATETIME2         NULL,
         LastIPAddress       NVARCHAR(45)      NULL,
         CreatedAt           DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
-        UpdatedAt           DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
+        UpdatedAt           DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
+        -- Optional display / GIS metadata. NULL = not assigned ("No location assigned").
+        -- Existing databases receive these via 005_device_metadata.sql.
+        Name                NVARCHAR(100)     NULL,
+        Latitude            DECIMAL(9,6)      NULL,
+        Longitude           DECIMAL(9,6)      NULL,
+        CONSTRAINT CK_Devices_Latitude      CHECK (Latitude  IS NULL OR (Latitude  BETWEEN -90  AND 90)),
+        CONSTRAINT CK_Devices_Longitude     CHECK (Longitude IS NULL OR (Longitude BETWEEN -180 AND 180)),
+        CONSTRAINT CK_Devices_LatLngPair    CHECK ((Latitude IS NULL AND Longitude IS NULL) OR (Latitude IS NOT NULL AND Longitude IS NOT NULL)),
+        CONSTRAINT CK_Devices_NotNullIsland CHECK (NOT (Latitude = 0 AND Longitude = 0))
     );
     PRINT 'Table Devices created.';
 END
@@ -193,5 +202,39 @@ BEGIN
         CreatedAt   DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
     );
     PRINT 'Table DeviceEvents created.';
+END
+GO
+
+-- ── ProtocolDiagnosticLogs (Protocol Test Log) ─────────────────────────────────
+-- Self-contained (no FK): unknown senders are logged without device registration.
+-- Only table purged by the 30-day retention task. Existing databases: 006_protocol_diagnostics.sql.
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = N'ProtocolDiagnosticLogs' AND schema_id = SCHEMA_ID(N'dbo'))
+BEGIN
+    CREATE TABLE dbo.ProtocolDiagnosticLogs (
+        Id               BIGINT         NOT NULL IDENTITY(1,1),
+        ReceivedAt       DATETIME2      NOT NULL,
+        Protocol         NVARCHAR(10)   NOT NULL,
+        Status           NVARCHAR(20)   NOT NULL,
+        Outcome          NVARCHAR(30)       NULL,
+        SourceIP         NVARCHAR(45)       NULL,
+        DeviceId         NVARCHAR(50)       NULL,
+        DeviceName       NVARCHAR(100)      NULL,
+        IMEI             NVARCHAR(20)       NULL,
+        SiteId           NVARCHAR(50)       NULL,
+        IsRegistered     BIT            NOT NULL DEFAULT 0,
+        Topic            NVARCHAR(255)      NULL,
+        QoS              INT                NULL,
+        Payload          NVARCHAR(4000) NOT NULL,
+        PayloadEncoding  NVARCHAR(10)   NOT NULL,
+        PayloadBytes     INT            NOT NULL,
+        PayloadTruncated BIT            NOT NULL DEFAULT 0,
+        ErrorReason      NVARCHAR(500)      NULL,
+        CreatedAt        DATETIME2      NOT NULL,
+        CONSTRAINT PK_ProtocolDiagnosticLogs PRIMARY KEY CLUSTERED (Id),
+        CONSTRAINT CK_ProtocolDiagnosticLogs_Protocol CHECK (Protocol IN (N'TCP', N'MQTT')),
+        CONSTRAINT CK_ProtocolDiagnosticLogs_Status   CHECK (Status IN (N'VALID', N'INVALID', N'UNKNOWN_DEVICE')),
+        CONSTRAINT CK_ProtocolDiagnosticLogs_Encoding CHECK (PayloadEncoding IN (N'TEXT', N'HEX'))
+    );
+    PRINT 'Table ProtocolDiagnosticLogs created.';
 END
 GO

@@ -49,3 +49,19 @@ GO
 
 PRINT 'Indexes applied.';
 GO
+
+-- ProtocolDiagnosticLogs (Protocol Test Log; existing databases: 006_protocol_diagnostics.sql)
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ProtocolDiagnosticLogs_Protocol_ReceivedAt' AND object_id = OBJECT_ID(N'dbo.ProtocolDiagnosticLogs'))
+BEGIN
+    CREATE NONCLUSTERED INDEX IX_ProtocolDiagnosticLogs_Protocol_ReceivedAt
+        ON dbo.ProtocolDiagnosticLogs (Protocol, ReceivedAt DESC, Id DESC);
+    PRINT 'Index IX_ProtocolDiagnosticLogs_Protocol_ReceivedAt created.';
+END
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ProtocolDiagnosticLogs_ReceivedAt' AND object_id = OBJECT_ID(N'dbo.ProtocolDiagnosticLogs'))
+BEGIN
+    CREATE NONCLUSTERED INDEX IX_ProtocolDiagnosticLogs_ReceivedAt
+        ON dbo.ProtocolDiagnosticLogs (ReceivedAt);
+    PRINT 'Index IX_ProtocolDiagnosticLogs_ReceivedAt created.';
+END
+GO

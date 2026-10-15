@@ -21,6 +21,29 @@ The server uses a pluggable parser chain:
 
 When the final Scanvix frame specification is received, add a concrete parser class in `backend/app/protocol/tcp_parser.py` implementing `TcpParser`. No other files need to change.
 
+## Scanvix production frame (`#SP`) - confirmed from a real captured packet
+
+Scanvix confirmed the captured packet as the production TCP frame; the wire format is authoritative.
+Implemented by `ScanvixSpFrameParser` (`backend/app/protocol/tcp_parser.py`):
+
+```
+#SP,<device id>,NUL<IMEI>,HH:MM:SS,DD/MM/YYYY,<sensor byte>,<signal>,<firmware>NUL,
+<4-byte binary field>, ... ,00000,00000,00000,00000,00000,00000,00000,.
+```
+
+- IMEI (15 digits, leading NUL stripped) is the device identity used for the Devices lookup. Unknown IMEIs are
+  UNKNOWN_DEVICE; nothing is auto-registered. `STORM-ENER` is the frame's device field and is not persisted.
+- Sensor byte `0x01` = RS485 (`rs485`). Signal is stored as received (28). Firmware `V001`.
+- 8 or 9 comma-terminated 4-byte binary fields (captured packet: 8 = 146 bytes; the field list: 9 = 151 bytes),
+  Instant Flow, Positive Totaliser, AI3, AI4, AI5, Today Total, Previous Day Total, 4-20mA 1, 4-20mA 2.
+  Located by position, never split on commas.
+- **Open item:** byte order and REAL4/LONG type are not confirmed. Only the all-zero value is decoded;
+  any non-zero binary field is rejected as a visible PARSE ERROR (raw bytes in the message) rather than guessed.
+  Implement `ScanvixSpFrameParser.decode_binary_field` once Scanvix confirms the encoding.
+- Persisted: flow, total_today, total_yesterday, sensor_type, signal, firmware, READ01-READ05 (first five trailing
+  fields). Not persisted (no model field): positive totaliser, AI3-5, 4-20mA inputs, trailing fields 6-7.
+- No flow unit is sent, so none is stored (analytics reports such meters as excluded rather than guessing).
+
 ## ACK Mechanism — TBD
 
 **The server-to-RTU acknowledgement byte sequence has not been agreed with Scanvix.**

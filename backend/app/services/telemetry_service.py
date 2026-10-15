@@ -43,31 +43,18 @@ class TelemetryService:
         """
         settings = self._settings
 
-        # 1. Verify device exists
+        # 1. Verify device exists. Unknown devices are NOT auto-registered: an arbitrary
+        #    sender must never create a Devices row. The message itself is already archived
+        #    by the caller (RawMessages + TCPMessages/MQTTMessages) and shown in the
+        #    Protocol Test Log as UNKNOWN_DEVICE; nothing is written to Devices/Telemetry.
+        #    Register the device (POST /api/devices) to start storing its telemetry.
         device = DeviceRepository.get_by_device_id(db, telemetry.device_id)
         if device is None:
             logger.warning(
-                "Telemetry from unknown device %s — creating auto-registration stub",
-                telemetry.device_id,
+                "Telemetry from unregistered device %s via %s rejected (not auto-registered)",
+                telemetry.device_id, telemetry.protocol,
             )
-            # Auto-register unknown device as a stub so data is never lost.
-            # An operator must complete the registration via the API.
-            device = DeviceRepository.create(
-                db,
-                DeviceId=telemetry.device_id,
-                IMEI=telemetry.device_id,
-                SiteId=telemetry.site_id,
-                CommunicationMode=telemetry.protocol,
-                IsActive=False,   # flagged for manual review
-            )
-            EventRepository.create(
-                db,
-                DeviceId=telemetry.device_id,
-                EventType="CONNECTED",
-                Description=f"Auto-registered unknown device via {telemetry.protocol}",
-                Severity="WARNING",
-                Protocol=telemetry.protocol,
-            )
+            return {"status": "unknown_device", "telemetry_id": None, "is_historical": False}
 
         # 2. Deduplication — QoS 1 may redeliver; check exact (device, timestamp, protocol)
         if TelemetryRepository.exists(db, telemetry.device_id, telemetry.timestamp, telemetry.protocol):

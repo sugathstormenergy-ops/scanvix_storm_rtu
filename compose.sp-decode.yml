@@ -1,0 +1,3 @@
+services:
+  storm-tcp:
+    image: storm-rtu-app:sp-decode-20261013

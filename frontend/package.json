@@ -1,0 +1,44 @@
+{
+  "name": "storm-rtu-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Storm Energy RTU web UI (UI/UX adapted from the reference dashboard; data from the Storm RTU API)",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fontsource/plus-jakarta-sans": "^5.2.8",
+    "@fortawesome/fontawesome-free": "^6.7.2",
+    "@tailwindcss/vite": "^4.3.1",
+    "chart.js": "^4.5.1",
+    "leaflet": "^1.9.4",
+    "leaflet.heat": "^0.2.0",
+    "react": "^19.2.6",
+    "react-chartjs-2": "^5.3.1",
+    "react-dom": "^19.2.6",
+    "react-leaflet": "^5.0.0",
+    "react-router-dom": "^7.18.0",
+    "reactflow": "^11.11.4",
+    "recharts": "^3.8.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@testing-library/react": "^16.3.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "eslint": "^10.3.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "globals": "^17.6.0",
+    "jsdom": "^27.0.0",
+    "tailwindcss": "^4.3.1",
+    "vite": "^8.0.12",
+    "vitest": "^4.1.9"
+  }
+}

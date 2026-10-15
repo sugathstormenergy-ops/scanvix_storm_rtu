@@ -1,5 +1,10 @@
 # Storm Energy RTU — Ansible Project
 
+> **Note (Docker migration):** the new Storm Energy RTU deployment on
+> **192.168.0.50** uses Docker Compose (repository `README.md`, `.\deploy.ps1`).
+> This Ansible project targets the existing server 192.168.0.109 and is kept
+> for reference (only this note was added). Do not run it against 192.168.0.50.
+
 Ansible automation for deploying and managing the **Storm Energy RTU platform** on Windows Server `192.168.0.109`.
 
 > **ISOLATION GUARANTEE**: This project is completely independent of the existing PFCMD/Allipuram Ansible project. It does not modify any existing inventory, playbook, service, database, firewall rule, or directory.

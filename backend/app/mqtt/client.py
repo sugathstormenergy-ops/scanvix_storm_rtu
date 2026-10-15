@@ -147,12 +147,17 @@ class MQTTClient:
         """Reissue every recorded subscription. Called after every successful
         (re)connect. Does not block: iterates and calls the non-blocking
         paho subscribe() for each topic, no sleeps/waits."""
-        if not self._subscriptions:
+        # Iterate over a snapshot: this runs on the paho network thread while
+        # MQTTConsumer.start() may be adding subscriptions from the main thread.
+        # Iterating the live dict raised "dictionary changed size during
+        # iteration" and killed the paho network thread (consumer silently deaf).
+        subscriptions = list(self._subscriptions.items())
+        if not subscriptions:
             return
-        for topic, qos in self._subscriptions.items():
+        for topic, qos in subscriptions:
             self._client.subscribe(topic, qos=qos)
         logger.info("MQTT resubscribed to %d topic(s) after (re)connect",
-                    len(self._subscriptions))
+                    len(subscriptions))
 
     def _on_disconnect(self, client, userdata, rc):
         self._connected.clear()

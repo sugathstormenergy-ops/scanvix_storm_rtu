@@ -1,0 +1,25 @@
+# Storm Energy RTU Platform — PRODUCTION RUNTIME dependencies (Docker image)
+# ==========================================================================
+# Only what the running application imports. Versions MUST stay identical to
+# the pins in requirements.txt (enforced by tests/unit/test_requirements_prod_sync.py).
+# requirements.txt is left unchanged because the Ansible Windows role stages
+# that single file to the target host.
+
+# Web framework
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+
+# Settings / validation
+pydantic==2.7.1
+pydantic-settings==2.2.1
+python-dotenv==1.0.1
+
+# Database (MS SQL Server via ODBC Driver 18, installed in the image)
+sqlalchemy==2.0.30
+pyodbc==5.1.0
+
+# MQTT
+paho-mqtt==2.0.0
+
+# Logging
+structlog==24.1.0

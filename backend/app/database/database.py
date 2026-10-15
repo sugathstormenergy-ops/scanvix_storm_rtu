@@ -31,6 +31,8 @@ def _build_engine():
         pool_recycle=settings.SQL_POOL_RECYCLE,
         pool_pre_ping=True,          # validate connections before use
         echo=settings.LOG_LEVEL == "DEBUG",
+        # pyodbc login timeout — bounded so health checks fail fast when SQL is unreachable
+        connect_args={"timeout": settings.SQL_CONNECT_TIMEOUT},
     )
 
     @event.listens_for(engine, "connect")

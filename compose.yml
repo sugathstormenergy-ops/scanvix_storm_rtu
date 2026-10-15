@@ -1,0 +1,201 @@
+# =============================================================================
+# Storm Energy RTU Platform — Docker Compose deployment (Windows Server 192.168.0.50)
+#
+#   reverse-proxy  nginx      host :443 -> 8443 (HTTPS), host :8080 -> 8080 (HTTP)
+#                             TLS from TLS_CERT_DIR (read-only bind mount, e.g. E:/certs)
+#                             routes / -> storm-frontend, /api/ and /health -> storm-api
+#   storm-frontend nginx      web UI (static build); NO host port - reached only via the proxy
+#   storm-api      FastAPI    host 127.0.0.1:8000 -> 8000 (loopback ONLY) + MQTT consumer
+#   storm-tcp      RTU TCP    host :8100 -> 8100 and host :444 -> 8100 (Scanvix test via NAT 444)
+#   mosquitto      MQTT       host :1884 -> 1883 (host Mosquitto keeps :1883)
+#
+# SQL Server stays on the Windows host (reached as host.docker.internal:1433).
+# 192.168.0.109 is NOT part of this deployment.
+#
+# All deployment-specific values and secrets come from the git-ignored .env
+# (template: .env.example). Use deploy.ps1 / update.ps1 / stop.ps1 rather than
+# raw commands; NEVER run `docker compose down -v` (it deletes the MQTT volume).
+# =============================================================================
+name: storm-rtu
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+
+x-storm-app: &storm-app
+  image: storm-rtu-app:${STORM_IMAGE_TAG:-local}
+  build:
+    context: ./backend
+    dockerfile: Dockerfile
+  env_file:
+    - .env
+  restart: unless-stopped
+  logging: *default-logging
+  <<: *hardening
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  networks:
+    - storm-net
+
+services:
+
+  storm-api:
+    <<: *storm-app
+    environment:
+      APP_ENV: production
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      SQL_SERVER: ${DOCKER_SQL_SERVER:-host.docker.internal}
+      SQL_PORT: ${DOCKER_SQL_PORT:-1433}
+      SQL_DRIVER: ODBC Driver 18 for SQL Server
+      SQL_CONNECT_TIMEOUT: ${SQL_CONNECT_TIMEOUT:-5}
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      MQTT_TLS_ENABLED: "false"
+      ENABLE_MQTT_CONSUMER: "true"
+      ENABLE_TCP_SERVER: "false"
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
+    healthcheck:
+      # Liveness only. Database state is reported by /health and checked by
+      # health-check.ps1 — it is never folded into "container healthy".
+      test: ["CMD", "python", "/usr/local/bin/storm-healthcheck", "http", "http://127.0.0.1:8000/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+
+  storm-tcp:
+    <<: *storm-app
+    command: ["python", "-m", "app.tcp.server"]
+    environment:
+      APP_ENV: production
+      TCP_HOST: 0.0.0.0
+      TCP_PORT: "8100"
+      SQL_SERVER: ${DOCKER_SQL_SERVER:-host.docker.internal}
+      SQL_PORT: ${DOCKER_SQL_PORT:-1433}
+      SQL_DRIVER: ODBC Driver 18 for SQL Server
+      SQL_CONNECT_TIMEOUT: ${SQL_CONNECT_TIMEOUT:-5}
+    ports:
+      - "${TCP_BIND_ADDRESS:-0.0.0.0}:${TCP_HOST_PORT:-8100}:8100"
+      # Scanvix test endpoint: router NAT public 444 -> 192.168.0.50:444 -> container 8100 (same listener, same parser).
+      # Public 8100 belongs to a legacy application on another host and is NOT used for Storm.
+      - "${TCP_BIND_ADDRESS:-0.0.0.0}:${TCP_PUBLIC_HOST_PORT:-444}:8100"
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/storm-healthcheck", "tcp-listen", "8100"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  mosquitto:
+    image: eclipse-mosquitto:${MOSQUITTO_IMAGE_TAG:-2.0.22}
+    entrypoint: ["/bin/sh", "/storm/entrypoint.sh"]
+    environment:
+      MQTT_USERNAME: ${MQTT_USERNAME:?set MQTT_USERNAME in .env}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
+    ports:
+      - "${MQTT_BIND_ADDRESS:-0.0.0.0}:${MQTT_HOST_PORT:-1884}:1883"
+    volumes:
+      - ./docker/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./docker/mosquitto/entrypoint.sh:/storm/entrypoint.sh:ro
+      - mosquitto-data:/mosquitto/data
+    restart: unless-stopped
+    logging: *default-logging
+    <<: *hardening
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h 127.0.0.1 -p 1883 -u \"$$MQTT_USERNAME\" -P \"$$MQTT_PASSWORD\" -t '$$SYS/broker/uptime' -C 1 -W 5 >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - storm-net
+
+  storm-frontend:
+    image: storm-rtu-frontend:${STORM_IMAGE_TAG:-local}
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NGINX_IMAGE_TAG: ${NGINX_IMAGE_TAG:-1.28-alpine}
+    # No `ports:` on purpose - the UI is served only through reverse-proxy.
+    restart: unless-stopped
+    logging: *default-logging
+    <<: *hardening
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - storm-net
+
+  reverse-proxy:
+    image: nginxinc/nginx-unprivileged:${NGINX_IMAGE_TAG:-1.28-alpine}
+    ports:
+      - "${HTTPS_BIND_ADDRESS:-0.0.0.0}:${HTTPS_HOST_PORT:-443}:8443"
+      - "${HTTP_BIND_ADDRESS:-0.0.0.0}:${HTTP_HOST_PORT:-8080}:8080"
+    environment:
+      # Only STORM_TLS_* variables are substituted into the nginx template.
+      NGINX_ENVSUBST_FILTER: "^STORM_TLS_"
+      STORM_TLS_CERT_FILE: ${TLS_CERT_FILE:-tls.crt}
+      STORM_TLS_KEY_FILE: ${TLS_KEY_FILE:-tls.key}
+      STORM_TLS_SERVER_NAME: ${TLS_SERVER_NAME:-_}
+    volumes:
+      - ./docker/nginx/templates/storm.conf.template:/etc/nginx/templates/default.conf.template:ro
+      # Certificate directory (e.g. E:/certs) - mounted READ-ONLY; the private
+      # key is never copied into the repository or the image.
+      - type: bind
+        source: ${TLS_CERT_DIR:-./certs}
+        target: /etc/nginx/certs
+        read_only: true
+        bind:
+          create_host_path: false
+    restart: unless-stopped
+    logging: *default-logging
+    <<: *hardening
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/nginx-health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      storm-api:
+        condition: service_healthy
+      storm-frontend:
+        condition: service_healthy
+    networks:
+      - storm-net
+
+networks:
+  storm-net:
+    name: storm-rtu-net
+    driver: bridge
+
+volumes:
+  mosquitto-data:
+    name: storm-rtu-mosquitto-data

@@ -1,0 +1,506 @@
+/**
+ * Schematic page — scoped styles (imported only by SchematicPage.jsx).
+ * Colours follow the design tokens in index.css.
+ */
+
+.schematic-page {
+  --schem-primary: #6C9BFF;
+  --schem-primary-dark: #3D6FE0;
+  --schem-success: #34D399;
+  --schem-warning: #F59E0B;
+  --schem-danger: #FF6B6B;
+  --schem-bg: #F9FBFF;
+
+  display: flex;
+  gap: 14px;
+  padding: 16px;
+  height: calc(100vh - 220px);
+  min-height: 520px;
+}
+
+@media (max-width: 900px) {
+  .schematic-page {
+    flex-direction: column;
+    height: auto;
+    min-height: 0;
+  }
+  .schematic-canvas-wrap { height: 60vh; min-height: 420px; }
+  .schematic-insights {
+    flex: 1 1 auto;
+    max-width: none;
+    max-height: none;
+    position: static;
+  }
+  .schematic-kpi-grid { grid-template-columns: repeat(4, 1fr); }
+}
+@media (max-width: 560px) {
+  .schematic-kpi-grid { grid-template-columns: 1fr 1fr; }
+}
+
+/* ── Canvas ────────────────────────────────────────────────────────────── */
+.schematic-canvas-wrap {
+  flex: 1 1 80%;
+  min-width: 0;
+  background:
+    radial-gradient(circle at 15% 8%, rgba(108,155,255,0.07), transparent 45%),
+    radial-gradient(circle at 90% 92%, rgba(52,211,153,0.05), transparent 40%),
+    linear-gradient(180deg, #FBFDFF 0%, var(--schem-bg) 100%);
+  border: 1px solid #DCE6FA;
+  border-radius: 14px;
+  overflow: hidden;
+  position: relative;
+  box-shadow:
+    0 1px 2px rgba(108,155,255,0.06),
+    0 8px 24px -12px rgba(108,155,255,0.16),
+    inset 0 1px 0 rgba(255,255,255,0.6);
+  padding: 4px;
+}
+
+.schematic-canvas-wrap .react-flow__attribution { display: none; }
+.schematic-canvas-wrap .react-flow__pane { cursor: default; }
+
+/* ReactFlow's built-in dotted background — recolored to sit quietly behind
+   the diagram instead of competing with it. */
+.schematic-canvas-wrap .react-flow__background {
+  opacity: 0.55;
+}
+
+.schematic-canvas-wrap .react-flow__controls {
+  box-shadow: 0 4px 16px -4px rgba(108,155,255,0.22);
+  border-radius: 9px;
+  overflow: hidden;
+  border: 1px solid #DCE6FA;
+}
+.schematic-canvas-wrap .react-flow__controls-button {
+  background: #ffffff;
+  border-bottom: 1px solid #F1F5F9;
+  transition: background 0.15s ease;
+}
+.schematic-canvas-wrap .react-flow__controls-button:hover { background: #F0F9FF; }
+.schematic-canvas-wrap .react-flow__controls-button svg { fill: #64748B; }
+
+/* ── Status banner ─────────────────────────────────────────────────────── */
+.schematic-status-banner {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 5;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 5px 12px 5px 10px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.85);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(52,211,153,0.35);
+  color: #15803D;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  box-shadow: 0 2px 10px -2px rgba(108,155,255,0.16);
+  transition: border-color 0.2s ease, color 0.2s ease;
+}
+.schematic-status-banner.is-syncing {
+  color: var(--schem-primary-dark);
+  border-color: rgba(108,155,255,0.35);
+}
+.schematic-status-banner .schem-dot-pulse {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 0 0 currentColor;
+  animation: schem-pulse-ring 1.6s ease-out infinite;
+}
+@keyframes schem-pulse-ring {
+  0%   { box-shadow: 0 0 0 0 rgba(52,211,153,0.45); opacity: 1; }
+  70%  { box-shadow: 0 0 0 6px rgba(52,211,153,0); opacity: 0.7; }
+  100% { box-shadow: 0 0 0 6px rgba(52,211,153,0); opacity: 1; }
+}
+
+/* ── Legend ────────────────────────────────────────────────────────────── */
+/* Documents the edge/dot color coding on-canvas so meaning isn't carried
+   by color alone (WCAG 1.4.1) — the primary fault-signaling channel on this
+   page otherwise has no text equivalent visible at a glance. */
+.schematic-legend {
+  position: absolute;
+  bottom: 12px;
+  right: 12px;
+  z-index: 5;
+  max-width: calc(100% - 24px);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.85);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid #DCE6FA;
+  box-shadow: 0 2px 10px -2px rgba(108,155,255,0.16);
+}
+.schematic-legend-item {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 9px; font-weight: 700; color: #64748B;
+  white-space: nowrap;
+}
+.schematic-legend-swatch { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.schematic-legend-swatch--edge-flow { background: var(--schem-primary); }
+.schematic-legend-swatch--edge-zero { background: var(--schem-danger); }
+.schematic-legend-swatch--dot-active { background: var(--schem-success); }
+.schematic-legend-swatch--dot-inactive { background: var(--schem-warning); }
+
+/* ── Loading / error states ───────────────────────────────────────────── */
+.schematic-unavailable {
+  height: 100%; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 10px; color: #94A3B8; font-size: 12px;
+}
+.schematic-unavailable i {
+  font-size: 18px; color: var(--schem-danger);
+  filter: drop-shadow(0 0 10px rgba(239,68,68,0.25));
+}
+
+.schematic-skeleton {
+  height: 100%; display: flex; align-items: center; justify-content: center;
+  gap: 10px; color: #94A3B8; font-size: 12px; font-weight: 600;
+}
+
+/* ── Nodes: shared ─────────────────────────────────────────────────────── */
+.schem-node {
+  border-radius: 14px;
+  padding: 10px 12px;
+  font-family: inherit;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  min-width: 120px;
+  transition: transform 200ms cubic-bezier(0.16, 1, 0.3, 1), box-shadow 200ms ease, border-color 200ms ease;
+  will-change: transform;
+}
+.schem-node:hover {
+  transform: translateY(-3px);
+}
+
+/* ── WTP node — glowing "source" ──────────────────────────────────────── */
+.schem-wtp {
+  position: relative;
+  background: linear-gradient(160deg, #F0FDF4 0%, #ECFDF5 100%);
+  border: 1.5px solid rgba(52,211,153,0.55);
+  color: #14532D;
+  box-shadow:
+    0 2px 6px rgba(22,163,74,0.10),
+    0 0 0 4px rgba(52,211,153,0.06);
+}
+.schem-wtp:hover {
+  box-shadow:
+    0 10px 24px -8px rgba(22,163,74,0.30),
+    0 0 0 6px rgba(52,211,153,0.10);
+  border-color: rgba(52,211,153,0.8);
+}
+.schem-wtp-glow {
+  position: absolute;
+  inset: -14px;
+  border-radius: 22px;
+  background: radial-gradient(circle, rgba(52,211,153,0.22) 0%, rgba(52,211,153,0) 70%);
+  animation: schem-source-breathe 3.2s ease-in-out infinite;
+  pointer-events: none;
+  z-index: -1;
+}
+@keyframes schem-source-breathe {
+  0%, 100% { opacity: 0.55; transform: scale(0.96); }
+  50%      { opacity: 1;    transform: scale(1.04); }
+}
+.schem-wtp-icon {
+  font-size: 18px; color: #047857;
+  width: 30px; height: 30px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(255,255,255,0.7);
+  box-shadow: inset 0 0 0 1px rgba(52,211,153,0.35);
+}
+.schem-wtp-label { font-size: 10.5px; font-weight: 800; margin-top: 5px; letter-spacing: 0.01em; }
+.schem-wtp-capacity {
+  font-size: 10px; color: #15803D; font-weight: 700;
+  margin-top: 1px; padding: 1px 8px; border-radius: 999px;
+  background: rgba(255,255,255,0.55);
+}
+
+/* ── Zone node — realistic tank ───────────────────────────────────────── */
+.schem-zone {
+  background: transparent;
+  border: none;
+  min-width: 130px;
+  box-shadow: none;
+}
+.schem-zone:hover { transform: translateY(-2px); }
+.schem-zone:hover .schem-tank-outline { stroke: #0C4A6E; }
+
+.schem-tank-svg {
+  width: 92px; height: 102px; overflow: visible;
+  filter: drop-shadow(0 6px 10px rgba(108,155,255,0.14));
+  transition: filter 200ms ease;
+}
+.schem-tank-outline {
+  fill: none;
+  stroke: #3D6FE0;
+  stroke-width: 2.5;
+  transition: stroke 200ms ease;
+}
+.schem-tank-highlight {
+  fill: none;
+  stroke: rgba(255,255,255,0.6);
+  stroke-width: 1.5;
+}
+.water-fill {
+  fill: url(#schemWaterGradient);
+  transition: transform 1.2s cubic-bezier(0.45, 0, 0.2, 1);
+}
+.water-surface {
+  fill: none;
+  stroke: rgba(255,255,255,0.55);
+  stroke-width: 1.5;
+  transition: transform 1.2s cubic-bezier(0.45, 0, 0.2, 1);
+}
+
+.schem-zone-label {
+  font-size: 10.5px; font-weight: 800; color: #0C4A6E; margin-top: 3px;
+  letter-spacing: 0.01em;
+}
+.schem-zone-metrics {
+  display: flex; gap: 5px; font-size: 8.5px; color: #64748B; font-weight: 700;
+  flex-wrap: wrap; justify-content: center; margin-top: 2px;
+}
+.schem-zone-metrics span {
+  background: #F1F5F9; border-radius: 5px; padding: 1.5px 5px;
+  border: 1px solid #DCE6FA;
+}
+
+/* ── Telemetry node — "live" data card ────────────────────────────────── */
+/* Brought onto the app's light/bezel card system (was a dark-glass card
+   that outranked the WTP/tank nodes in visual weight — see DESIGN.md
+   "The Bezel Rule" / "The Tinted-Not-Black Rule"). The status dot is now
+   the only color-carrying element; the flow value uses Current Ink at
+   weight 800, matching how .schematic-kpi-value/.hstat-value read
+   emphasis elsewhere in the app. */
+.schem-telemetry {
+  position: relative;
+  background: #FFFFFF;
+  border: 1px solid #DCE6FA;
+  min-width: 132px;
+  box-shadow: 0 1px 3px rgba(108,155,255,0.08);
+  overflow: hidden;
+}
+.schem-telemetry:hover {
+  border-color: #3D6FE0;
+  box-shadow: 0 4px 12px -6px rgba(108,155,255,0.25);
+}
+.schem-telemetry.is-inactive {
+  border-color: rgba(245,158,11,0.45);
+}
+.schem-telemetry.is-inactive:hover {
+  border-color: #B45309;
+  box-shadow: 0 4px 12px -6px rgba(245,158,11,0.25);
+}
+
+.schem-tele-header { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.schem-tele-label { font-size: 10px; font-weight: 700; color: #0F172A; letter-spacing: 0.01em; }
+/* Status carried by color (dot) AND text — WCAG 1.4.1, not color alone. */
+.schem-tele-status-word {
+  margin-left: auto; font-size: 8.5px; font-weight: 700; letter-spacing: 0.02em;
+  color: #047857;
+}
+.schem-tele-status-word.is-inactive { color: #B45309; }
+
+.schem-status-dot { position: relative; width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.schem-dot-green { background: var(--schem-success); box-shadow: 0 0 8px rgba(52,211,153,0.75); }
+.schem-dot-yellow { background: var(--schem-warning); box-shadow: 0 0 8px rgba(245,158,11,0.7); }
+.schem-status-dot .schem-dot-ping {
+  position: absolute; inset: 0; border-radius: 50%;
+  background: currentColor;
+  animation: schem-ping 1.8s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+.schem-dot-green .schem-dot-ping { color: var(--schem-success); }
+.schem-dot-yellow .schem-dot-ping { color: var(--schem-warning); animation-duration: 2.6s; }
+@keyframes schem-ping {
+  0%   { transform: scale(1); opacity: 0.6; }
+  100% { transform: scale(2.6); opacity: 0; }
+}
+
+.schem-tele-metric {
+  font-size: 18px; font-weight: 800; color: #0C4A6E; line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.schem-tele-unit { font-size: 8.5px; color: #64748B; font-weight: 700; margin-left: 3px; }
+.schem-tele-sub { font-size: 9.5px; color: #64748B; margin-top: 2px; font-weight: 600; }
+.schem-tele-ts { font-size: 8.5px; color: #64748B; margin-top: 3px; }
+
+/* ── Static block node ────────────────────────────────────────────────── */
+.schem-block {
+  background: #FFFFFF;
+  border: 1.5px dashed #DCE6FA;
+  min-width: 90px;
+  padding: 7px 12px;
+  box-shadow: 0 1px 3px rgba(108,155,255,0.08);
+}
+.schem-block:hover { border-color: #3D6FE0; transform: translateY(-2px); }
+.schem-block-label { font-size: 10px; font-weight: 700; color: #64748B; letter-spacing: 0.03em; }
+
+/* ── Edges ─────────────────────────────────────────────────────────────── */
+.schematic-canvas-wrap .react-flow__edge-path {
+  stroke-width: 2.4px;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 3px rgba(108,155,255,0.35));
+  transition: stroke 200ms ease, filter 200ms ease;
+}
+.schematic-canvas-wrap .react-flow__edge.selected .react-flow__edge-path,
+.schematic-canvas-wrap .react-flow__edge:hover .react-flow__edge-path {
+  filter: drop-shadow(0 0 5px rgba(108,155,255,0.55));
+}
+/* Zero-flow edges get a red glow instead of a blue one — the stroke color
+   itself is still set inline per-edge in JS (#ef4444), only the glow here. */
+.schematic-canvas-wrap .react-flow__edge.schem-edge-zero .react-flow__edge-path {
+  filter: drop-shadow(0 0 4px rgba(239,68,68,0.4));
+}
+.schematic-canvas-wrap .react-flow__edge-text {
+  font-size: 9px; font-weight: 700; fill: #64748B;
+}
+.schematic-canvas-wrap .react-flow__edge-textbg { fill: #ffffff; opacity: 0.9; }
+
+.schematic-canvas-wrap .react-flow__connection-path,
+.schematic-canvas-wrap .react-flow__edge-path {
+  stroke-dasharray: none;
+}
+.schematic-canvas-wrap .react-flow__edge.animated .react-flow__edge-path {
+  stroke-dasharray: 6 4;
+  animation: schem-dash-flow 0.9s linear infinite;
+}
+@keyframes schem-dash-flow {
+  to { stroke-dashoffset: -10; }
+}
+
+/* ── Insights sidebar ──────────────────────────────────────────────────── */
+.schematic-insights {
+  flex: 0 0 20%;
+  min-width: 232px;
+  max-width: 320px;
+  display: flex;
+  flex-direction: column;
+  background: linear-gradient(180deg, #FFFFFF 0%, #FCFEFF 100%);
+  border: 1px solid #DCE6FA;
+  border-radius: 14px;
+  padding: 14px 15px;
+  box-shadow:
+    0 1px 2px rgba(108,155,255,0.06),
+    0 8px 24px -12px rgba(108,155,255,0.16);
+  position: sticky;
+  top: 0;
+  height: fit-content;
+  max-height: 100%;
+  overflow: hidden;
+}
+.schematic-insights-title {
+  font-size: 12px; font-weight: 800; color: #0F172A;
+  display: flex; align-items: center; gap: 7px; margin-bottom: 12px;
+  letter-spacing: 0.01em;
+}
+.schematic-insights-title i {
+  color: var(--schem-primary);
+  font-size: 12px;
+}
+
+.schematic-kpi-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px;
+}
+.schematic-kpi {
+  position: relative;
+  background: linear-gradient(160deg, #FFFFFF 0%, #F8FAFC 100%);
+  border: 1px solid #DCE6FA;
+  border-radius: 9px;
+  padding: 9px 8px 8px;
+  text-align: center;
+  overflow: hidden;
+  transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
+}
+.schematic-kpi::before {
+  content: '';
+  position: absolute; top: 0; left: 0; right: 0; height: 2.5px;
+  background: linear-gradient(90deg, var(--schem-primary), var(--schem-success));
+  opacity: 0.85;
+}
+.schematic-kpi:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 18px -8px rgba(108,155,255,0.24);
+  border-color: #3D6FE0;
+}
+.schematic-kpi-value {
+  font-size: 18px; font-weight: 800; color: #0F172A;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.schematic-kpi-label {
+  font-size: 9px; color: #64748B; font-weight: 700; margin-top: 3px;
+  text-transform: uppercase; letter-spacing: 0.03em;
+}
+
+.schematic-track-list {
+  flex: 1 1 auto; overflow-y: auto; min-height: 0;
+  display: flex; flex-direction: column; gap: 7px;
+}
+.schematic-track-card {
+  position: relative;
+  background: #F8FAFC;
+  border: 1px solid #DCE6FA;
+  border-radius: 9px;
+  padding: 9px 11px;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 180ms ease, background 180ms ease, transform 180ms ease, box-shadow 180ms ease;
+  width: 100%; display: block; font: inherit; color: inherit; outline: none;
+  appearance: none; -webkit-appearance: none;
+}
+.schematic-track-card:focus-visible {
+  border-color: var(--schem-primary);
+  box-shadow: 0 0 0 3px rgba(108,155,255,0.2);
+}
+.schematic-track-card:hover {
+  border-color: #3D6FE0;
+  background: #F0F9FF;
+  transform: translateX(2px);
+  box-shadow: 0 4px 12px -6px rgba(108,155,255,0.25);
+}
+.schematic-track-card-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.schematic-track-card-name { font-size: 10.5px; font-weight: 800; color: #0F172A; }
+.schematic-track-card-flow {
+  font-size: 10px; font-weight: 800; color: var(--schem-primary-dark);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.schematic-track-card-meta { font-size: 9px; color: #94A3B8; margin-top: 3px; font-weight: 600; }
+
+.schematic-track-list::-webkit-scrollbar { width: 6px; }
+.schematic-track-list::-webkit-scrollbar-track { background: transparent; }
+.schematic-track-list::-webkit-scrollbar-thumb { background: #DCE6FA; border-radius: 999px; }
+.schematic-track-list::-webkit-scrollbar-thumb:hover { background: var(--schem-primary); }
+
+/* ── Reduced motion ────────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .schem-dot-pulse,
+  .schem-wtp-glow,
+  .schem-dot-ping,
+  .schematic-canvas-wrap .react-flow__edge.animated .react-flow__edge-path {
+    animation: none;
+  }
+  .schem-node:hover,
+  .schematic-kpi:hover,
+  .schematic-track-card:hover {
+    transform: none;
+  }
+  .schem-node,
+  .schematic-kpi,
+  .schematic-track-card,
+  .water-fill,
+  .water-surface {
+    /* Fill level (water-fill/water-surface) is still set via inline
+       `transform` per render — only the animated transition is disabled,
+       the resting position is untouched. */
+    transition: none;
+  }
+}
